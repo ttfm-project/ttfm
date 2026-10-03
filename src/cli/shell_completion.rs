@@ -222,6 +222,21 @@ pub fn query_arg_role(args: &[String]) -> Option<TtqlRole> {
 pub enum ShellKind {
     Bash,
     Zsh,
+    Fish,
+}
+
+impl ShellKind {
+    pub fn script(self) -> &'static str {
+        match self {
+            ShellKind::Bash => {
+                include_str!("../../scripts/completion/ttfm.bash")
+            }
+            ShellKind::Zsh => include_str!("../../scripts/completion/_ttfm"),
+            ShellKind::Fish => {
+                include_str!("../../scripts/completion/ttfm.fish")
+            }
+        }
+    }
 }
 
 pub fn shell_candidates(
@@ -272,7 +287,7 @@ pub fn shell_candidates(
         })
         .collect();
     match shell {
-        ShellKind::Zsh => replacements
+        ShellKind::Zsh | ShellKind::Fish => replacements
             .into_iter()
             .filter(|r| !r.chars().any(char::is_control))
             .collect(),
@@ -508,6 +523,23 @@ mod tests {
             line.len(),
             "",
             ShellKind::Zsh,
+            0,
+            10,
+        );
+        assert_eq!(cli, ["filename:\"my file.txt\" "]);
+    }
+
+    #[test]
+    fn test_shell_candidates_fish_returns_dequoted_argument() {
+        let (_dir, store, reg) = setup_test_store_with_files(&["my file.txt"]);
+        let line = "ttfm search 'filename:my";
+        let cli = shell_candidates(
+            &store,
+            &reg,
+            line,
+            line.len(),
+            "",
+            ShellKind::Fish,
             0,
             10,
         );

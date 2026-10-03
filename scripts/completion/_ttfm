@@ -25,3 +25,6 @@ _ttfm() {
         _files
     fi
 }
+
+(( $+functions[compdef] )) || { autoload -Uz compinit && compinit; }
+compdef _ttfm ttfm

@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      all: ${{ steps.tag.outputs.all }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+      - id: tag
+        run: |
+          msg=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
+          case "$msg" in
+            *"[all]"*) echo "all=true" ;;
+            *) echo "all=false" ;;
+          esac >> "$GITHUB_OUTPUT"
+
+  linux:
+    runs-on: ubuntu-22.04
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - run: cargo build --release --locked --target "$TARGET"
+      - run: cargo test --release --locked --target "$TARGET" --test integration_main test_installer
+      - run: |
+          asset=ttfm-$TARGET.tar.gz
+          tar czf "$asset" -C "target/$TARGET/release" ttfm
+          shasum -a 256 "$asset" > "$asset.sha256"
+      - run: gh release upload "$GITHUB_REF_NAME" ttfm-*.tar.gz* --clobber || gh release create "$GITHUB_REF_NAME" ttfm-*.tar.gz*
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  apple_silicon:
+    needs: [plan, linux]
+    if: needs.plan.outputs.all == 'true'
+    uses: ./.github/workflows/macos.yml
+    with:
+      ref: ${{ github.ref_name }}
+      release: true

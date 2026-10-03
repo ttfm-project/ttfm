@@ -56,6 +56,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if let Some(Commands::Completion { shell }) = &cli.command {
+        print!("{}", shell.script());
+        return Ok(());
+    }
+
     if let Some(Commands::Complete {
         offset,
         point,
@@ -268,6 +273,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             Commands::Clear { .. } => unreachable!("Handled early"),
             Commands::Complete { .. } => unreachable!("Handled early"),
+            Commands::Completion { .. } => unreachable!("Handled early"),
             Commands::Note { content } => {
                 let id = ttfm::tagging::add_item(
                     &store, &registry, "note", content,

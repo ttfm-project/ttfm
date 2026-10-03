@@ -159,6 +159,12 @@ pub enum Commands {
         #[arg(trailing_var_arg = true)]
         query: Vec<String>,
     },
+    /// シェル補完スクリプトを出力します。
+    Completion {
+        /// 対象シェル
+        #[arg(value_enum)]
+        shell: ShellKind,
+    },
 }
 
 pub fn build_write_options(cli: &Cli, config: &Config) -> WriteOptions {
@@ -264,6 +270,18 @@ mod tests {
                 assert_eq!(query, vec!["ttfm search x"]);
             }
             _ => panic!("expected Complete command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_completion_command() {
+        let parsed =
+            Cli::try_parse_from(["ttfm", "completion", "fish"]).unwrap();
+        match parsed.command {
+            Some(Commands::Completion { shell }) => {
+                assert_eq!(shell, ShellKind::Fish);
+            }
+            _ => panic!("expected Completion command"),
         }
     }
 }

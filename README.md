@@ -2,6 +2,32 @@
 
 An innovative file manager based on typed tags (`type:label` format).
 
+## Installation
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/coponhub/TTFM/main/ttfm_cli.sh | sh
+```
+
+- Supported platforms: Linux x86_64, macOS Apple Silicon (11.0+)
+- Other platforms: `cargo install --git https://github.com/coponhub/TTFM`
+- Environment variables:
+  - `TTFM_VERSION`: install a specific version, e.g. `0.1.0` (default: latest)
+  - `TTFM_INSTALL_DIR`: install directory (default: `~/.local/bin`)
+
+### Shell completion
+
+- bash (4+) / fish: installed automatically
+- zsh: add `source <(ttfm completion zsh)` to `~/.zshrc`
+- bash without bash-completion: add `eval "$(ttfm completion bash)"` to `~/.bashrc`
+
+### Uninstall
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/coponhub/TTFM/main/ttfm_cli.sh | sh -s -- --uninstall
+```
+
+Add `--purge` to also remove user data (`TTFM_HOME`, default: `~/.ttfm`).
+
 ## License
 
 Copyright (C) 2026 The TTFM Project Contributors

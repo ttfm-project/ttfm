@@ -258,6 +258,35 @@ fn test_bash_completion_script_has_nospace() {
 }
 
 #[test]
+fn test_completion_subcommand_prints_embedded_scripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("absent");
+    for (shell, file) in [
+        ("bash", "ttfm.bash"),
+        ("zsh", "_ttfm"),
+        ("fish", "ttfm.fish"),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ttfm"))
+            .env("TTFM_HOME", &home)
+            .args(["completion", shell])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ttfm completion {shell} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let expected = std::fs::read(format!(
+            "{}/scripts/completion/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        assert_eq!(out.stdout, expected, "script mismatch for {shell}");
+        assert!(!home.exists());
+    }
+}
+
+#[test]
 fn test_dispatch_command_scoped_guard_prevents_deadlock() {
     use std::sync::{Arc, Mutex};
     use ttfm::cli::interactive::state::State;
