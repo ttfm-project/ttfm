@@ -540,6 +540,10 @@ pub trait TagFunction: Send + Sync {
     fn exclude_in_tags_table(&self) -> bool {
         false
     }
+
+    fn format_suggestions(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 // ============================================================
@@ -598,6 +602,18 @@ pub struct TagRegistry {
     builtin_offsets: std::collections::HashMap<String, u32>,
     next_builtin_offset: u32,
     type_configs: std::sync::RwLock<TypeRegistry>,
+}
+
+impl Clone for TagRegistry {
+    fn clone(&self) -> Self {
+        let type_configs = self.type_configs.read().unwrap().clone();
+        Self {
+            functions: self.functions.clone(),
+            builtin_offsets: self.builtin_offsets.clone(),
+            next_builtin_offset: self.next_builtin_offset,
+            type_configs: std::sync::RwLock::new(type_configs),
+        }
+    }
 }
 
 impl Default for TagRegistry {
@@ -1316,6 +1332,9 @@ impl TagFunction for IsDirFn {
     fn query(&self) -> &dyn Query {
         self
     }
+    fn format_suggestions(&self) -> Vec<String> {
+        vec!["true".to_string(), "false".to_string()]
+    }
 }
 impl Index for IsDirFn {
     fn extract(&self, path: &Path) -> Result<Option<Bitical>> {
@@ -1611,6 +1630,12 @@ impl TagFunction for SizeFn {
     fn exclude_in_tags_table(&self) -> bool {
         true
     }
+    fn format_suggestions(&self) -> Vec<String> {
+        vec!["10.0MB", "10.0GB", "10.0KB", "10.0TB", "10.0PB", "1B"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
 }
 impl Scan for SizeFn {
     fn name() -> &'static str {
@@ -1760,6 +1785,19 @@ impl TagFunction for MtimeFn {
     }
     fn exclude_in_tags_table(&self) -> bool {
         true
+    }
+    fn format_suggestions(&self) -> Vec<String> {
+        let now = chrono::Local::now();
+        vec![
+            now.format("%Y-%m-%d").to_string(),
+            now.format("%Y-%m-%d %H:%M").to_string(),
+            now.format("%Y-%m-%d %H:%M:%S").to_string(),
+            now.format("%Y-%m").to_string(),
+            now.format("%Y").to_string(),
+            "today".to_string(),
+            "yesterday".to_string(),
+            "7d ago".to_string(),
+        ]
     }
 }
 impl Edit for MtimeFn {
@@ -2039,6 +2077,12 @@ impl TagFunction for ItemKindFn {
     fn default_rank(&self) -> Rank {
         crate::rank::SystemRank::ITEM_KIND
     }
+    fn format_suggestions(&self) -> Vec<String> {
+        use strum::IntoEnumIterator;
+        crate::types::ItemKind::iter()
+            .map(|k| k.to_string())
+            .collect()
+    }
 }
 impl Edit for ItemKindFn {
     fn strategy(&self) -> EditStrategy {
@@ -2147,6 +2191,12 @@ impl TagFunction for OriginFn {
     }
     fn query(&self) -> &dyn Query {
         self
+    }
+    fn format_suggestions(&self) -> Vec<String> {
+        use strum::IntoEnumIterator;
+        crate::types::Origin::iter()
+            .map(|o| o.to_string())
+            .collect()
     }
 }
 impl Query for OriginFn {
@@ -4420,5 +4470,28 @@ mod tests {
             reg.type_config(&crate::types::TagType::from("quota")),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    #[test]
+    fn test_size_fn_format_suggestions() {
+        let suggestions = SizeFn.format_suggestions();
+        assert_eq!(
+            suggestions,
+            vec!["10.0MB", "10.0GB", "10.0KB", "10.0TB", "10.0PB", "1B"]
+        );
+    }
+
+    #[test]
+    fn test_mtime_fn_format_suggestions() {
+        let suggestions = MtimeFn.format_suggestions();
+        let now_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(suggestions.first(), Some(&now_str));
+        assert!(suggestions.contains(&"today".to_string()));
+        assert!(!suggestions.iter().any(|s| s.ends_with(' ')));
     }
 }

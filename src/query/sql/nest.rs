@@ -1131,7 +1131,11 @@ pub(super) fn build_fetch_nest_sql(
     if let Some(node) = resolver.get_label_set_op_node() {
         label_set_op_sql(src, node, resolver, limit, offset)
     } else {
-        let pick = PickNode::new(src, &resolver.resolved_query);
+        let pick = PickNode::new(
+            src,
+            &resolver.resolved_query,
+            &resolver.definition_storage,
+        );
         nest(src, &pick, resolver, limit, offset)
     }
 }
@@ -1163,7 +1167,10 @@ pub(super) fn nest(
 
     if let Some(proj_type) = resolver.get_single_direct_projection() {
         if resolver.data_source(&proj_type) == DataSource::TagsPartition {
-            let tags_dir = resolver.store_tags_dir.as_ref().unwrap();
+            let tags = resolver
+                .definition_storage
+                .tags_query(Some(&proj_type), None)
+                .unwrap();
             let mut q = Query::select();
             let desc = resolver
                 .lens()
@@ -1171,14 +1178,6 @@ pub(super) fn nest(
             let bitical_type = desc.logical_type.to_bitical();
             let rep_label =
                 Expr::col((Tbl::Tags, Col::Label)).cast_as(bitical_type);
-
-            let type_cond =
-                if let Some(fb) = resolver.fallback_tag_type(&proj_type) {
-                    Expr::col((Tbl::Tags, Col::Type))
-                        .is_in([proj_type.as_str(), fb.as_str()])
-                } else {
-                    Expr::col((Tbl::Tags, Col::Type)).eq(proj_type.as_str())
-                };
 
             q.distinct()
                 .expr_as(Expr::val(None::<i64>), Col::ItemId)
@@ -1192,11 +1191,8 @@ pub(super) fn nest(
                     crate::db::CustomFunc::as_representative(rep_label),
                     Pronoun::Representative,
                 )
-                .from_subquery(
-                    crate::util::hive_parquet_query(tags_dir),
-                    Tbl::Tags,
-                )
-                .and_where(type_cond);
+                .from_subquery(tags, Tbl::Tags)
+                .and_where(Expr::col((Tbl::Tags, Col::IsAttached)).eq(true));
 
             if limit > 0 {
                 q.limit((limit + 1) as u64);
@@ -1204,7 +1200,8 @@ pub(super) fn nest(
             if offset > 0 {
                 q.offset(offset as u64);
             }
-            q.order_by(Pronoun::Representative, sea_query::Order::Asc);
+            q.order_by((Tbl::Tags, Col::Rank), sea_query::Order::Desc)
+                .order_by(Pronoun::Representative, sea_query::Order::Asc);
             return Ok(q);
         }
     }
@@ -1253,8 +1250,11 @@ pub(super) fn nest(
                     nest_ctx,
                 )
             } else {
-                computed_agg_ctx =
-                    build_aggregation_context_for_operand(src, nv);
+                computed_agg_ctx = build_aggregation_context_for_operand(
+                    src,
+                    nv,
+                    &resolver.definition_storage,
+                );
                 build_nvalue_cte(
                     src,
                     proj_operands,
@@ -1768,7 +1768,11 @@ fn label_set_op_sql(
         .map(|i| format!("labels_{}", i))
         .collect();
     for (i, operand) in operands.iter().enumerate() {
-        let ids_sql = wrap_to_item_ids(build_pick(src, operand));
+        let ids_sql = wrap_to_item_ids(build_pick(
+            src,
+            operand,
+            &resolver.definition_storage,
+        ));
 
         let labels_sql = if matches!(op, LabelSetOpKind::Union) {
             if let Some(keys) = extract_multi_key_nest_operands(operand) {
@@ -1807,7 +1811,11 @@ fn label_set_op_sql(
         && extract_multi_key_nest_operands(operands.first().unwrap()).is_some();
 
     if use_item_level_except {
-        let right_ids_sql = wrap_to_item_ids(build_pick(src, &operands[1]));
+        let right_ids_sql = wrap_to_item_ids(build_pick(
+            src,
+            &operands[1],
+            &resolver.definition_storage,
+        ));
 
         let mut labels_sql = Query::select();
         labels_sql
@@ -2008,7 +2016,7 @@ fn label_set_op_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::lens_resolver::Resolver;
+    use crate::query::lens_resolver::{DefinitionStorage, Resolver};
     use crate::tag::TagRegistry;
     use sea_query::PostgresQueryBuilder;
 
@@ -2340,7 +2348,12 @@ mod tests {
         .unwrap();
         let optimized =
             crate::query::lens_optimizer::optimize(resolver.resolved_query);
-        let sql = PickNode::new(&Src::OneView, &optimized).build_pick();
+        let sql = PickNode::new(
+            &Src::OneView,
+            &optimized,
+            &resolver.definition_storage,
+        )
+        .build_pick();
         println!(
             "Generated FETCH ITEMS SQL: {}",
             sql.to_string(sea_query::PostgresQueryBuilder)
@@ -2381,7 +2394,8 @@ mod tests {
             context: None,
         };
 
-        let sql = build_pick(&Src::OneView, &nest_two_keys)
+        let storage = DefinitionStorage::default();
+        let sql = build_pick(&Src::OneView, &nest_two_keys, &storage)
             .to_string(PostgresQueryBuilder);
 
         assert!(
@@ -2411,7 +2425,8 @@ mod tests {
             context: None,
         };
 
-        let sql = build_pick(&Src::OneView, &nest_one_key)
+        let storage = DefinitionStorage::default();
+        let sql = build_pick(&Src::OneView, &nest_one_key, &storage)
             .to_string(PostgresQueryBuilder);
 
         assert!(
@@ -2580,5 +2595,75 @@ mod tests {
         assert!(!sql_str.contains("count(*) OVER"));
         assert!(!sql_str.contains("|| list_value("));
         assert!(sql_str.contains("nvalue_agg"));
+    }
+
+    #[test]
+    fn test_nest_tags_partition_orders_by_rank_desc_then_representative() {
+        let temp = tempfile::tempdir().unwrap();
+        let tags_dir = temp.path().join("tags");
+        let file_ext = tags_dir.join("origin=file/type=extension");
+        std::fs::create_dir_all(&file_ext).unwrap();
+        std::fs::File::create(file_ext.join("data.parquet")).unwrap();
+        let registry = TagRegistry::with_standard();
+        let resolver = Resolver::new_nowarn("extension:", &registry)
+            .unwrap()
+            .with_short(true)
+            .with_store_tags_dir(Some(tags_dir));
+        let sql =
+            build_fetch_nest_sql(&Src::OneView, &resolver, 10, 0).unwrap();
+        let sql_str = sql.to_string(PostgresQueryBuilder);
+        assert!(sql_str.contains(
+            "ORDER BY \"tags\".\"rank\" DESC, \"representative\" ASC"
+        ));
+    }
+
+    #[test]
+    fn test_nest_other_type_context_skips_tags_partition() {
+        let temp = tempfile::tempdir().unwrap();
+        let tags_dir = temp.path().join("tags");
+        let file_ext = tags_dir.join("origin=file/type=extension");
+        std::fs::create_dir_all(&file_ext).unwrap();
+        std::fs::File::create(file_ext.join("data.parquet")).unwrap();
+        let sql_str = build_fetch_nest_sql(
+            &Src::OneView,
+            &Resolver::new_nowarn(
+                "extension: & mtime:>2020-01-01",
+                &TagRegistry::with_standard(),
+            )
+            .unwrap()
+            .with_short(true)
+            .with_store_tags_dir(Some(tags_dir)),
+            10,
+            0,
+        )
+        .unwrap()
+        .to_string(PostgresQueryBuilder);
+        assert!(
+            !sql_str.contains("hive_partitioning"),
+            "other-type filter must not tags-partition, got: {}",
+            sql_str
+        );
+    }
+
+    #[test]
+    fn test_nest_tags_partition_reads_only_projection_type() {
+        let temp = tempfile::tempdir().unwrap();
+        let tags_dir = temp.path().join("tags");
+        let name_part = tags_dir.join("origin=file/type=name");
+        std::fs::create_dir_all(&name_part).unwrap();
+        std::fs::File::create(name_part.join("data.parquet")).unwrap();
+        let fname_part = tags_dir.join("origin=file/type=filename");
+        std::fs::create_dir_all(&fname_part).unwrap();
+        std::fs::File::create(fname_part.join("data.parquet")).unwrap();
+        let registry = TagRegistry::with_standard();
+        let resolver = Resolver::new_nowarn("name:", &registry)
+            .unwrap()
+            .with_short(true)
+            .with_store_tags_dir(Some(tags_dir));
+        let sql = build_fetch_nest_sql(&Src::OneView, &resolver, 10, 0)
+            .unwrap()
+            .to_string(PostgresQueryBuilder);
+        assert!(sql.contains("'name'"), "{sql}");
+        assert!(!sql.contains("filename"), "{sql}");
     }
 }

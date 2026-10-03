@@ -131,7 +131,7 @@ fn test_interactive_index_command_passes_progress_view() {
     Indexer::new(&store, &registry).initialize_tables().unwrap();
 
     let mut state = State::new();
-    let last_path = Arc::new(Mutex::new(".".to_string()));
+    let mut last_path = ".".to_string();
     let mut stdin = std::io::empty();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -143,7 +143,7 @@ fn test_interactive_index_command_passes_progress_view() {
         &registry,
         &Config::default(),
         WriteOptions::default(),
-        &last_path,
+        &mut last_path,
         &mut stdin,
         &mut stdout,
         &mut stderr,

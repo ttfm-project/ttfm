@@ -17,7 +17,7 @@
 
 use sea_query::PostgresQueryBuilder;
 use ttfm::db::Src;
-use ttfm::query::lens_resolver::Resolver;
+use ttfm::query::lens_resolver::{DefinitionStorage, Resolver};
 use ttfm::query::sql::BuildPick;
 use ttfm::tag::TagRegistry;
 
@@ -40,8 +40,12 @@ fn test_build_optimized_merged_projection_sql_logical() {
             .resolved_query;
     let optimized = ttfm::query::lens_optimizer::optimize(resolved);
 
-    let stmt =
-        ttfm::query::sql::PickNode::new(&Src::OneView, &optimized).build_pick();
+    let stmt = ttfm::query::sql::PickNode::new(
+        &Src::OneView,
+        &optimized,
+        &DefinitionStorage::default(),
+    )
+    .build_pick();
     let sql = normalize_sql(&stmt.to_string(PostgresQueryBuilder));
     println!("Logical SQL: {}", sql);
 
@@ -80,8 +84,12 @@ fn test_build_optimized_merged_projection_sql_arithmetic() {
             .resolved_query;
     let optimized = ttfm::query::lens_optimizer::optimize(resolved);
 
-    let stmt =
-        ttfm::query::sql::PickNode::new(&Src::OneView, &optimized).build_pick();
+    let stmt = ttfm::query::sql::PickNode::new(
+        &Src::OneView,
+        &optimized,
+        &DefinitionStorage::default(),
+    )
+    .build_pick();
     let sql = normalize_sql(&stmt.to_string(PostgresQueryBuilder));
     println!("Arithmetic SQL: {}", sql);
 
@@ -126,8 +134,12 @@ fn test_build_optimized_merged_projection_sql_comparison() {
             .resolved_query;
     let optimized = ttfm::query::lens_optimizer::optimize(resolved);
 
-    let stmt =
-        ttfm::query::sql::PickNode::new(&Src::OneView, &optimized).build_pick();
+    let stmt = ttfm::query::sql::PickNode::new(
+        &Src::OneView,
+        &optimized,
+        &DefinitionStorage::default(),
+    )
+    .build_pick();
     let sql = normalize_sql(&stmt.to_string(PostgresQueryBuilder));
     println!("Comparison SQL: {}", sql);
 

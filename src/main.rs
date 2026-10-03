@@ -38,17 +38,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run(cli)
 }
 
+fn open_store_and_initialize(
+    db_dir: &std::path::Path,
+    registry: &TagRegistry,
+) -> Result<Store, Box<dyn std::error::Error>> {
+    let store = Store::open(db_dir)?;
+    ttfm::indexing::Indexer::new(&store, registry).initialize_tables()?;
+    registry.load_type_configs(&store)?;
+    Ok(store)
+}
+
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(Commands::Clear { all }) = cli.command {
+    if let Some(Commands::Clear { all: true }) = cli.command {
         let home = ttfm::get_ttfm_home()?;
-        if all {
-            Store::delete_database(home.join("db").as_path())?;
-            safe_println!("Database cleared successfully.");
-        } else {
-            let store = Store::open(home.join("db"))?;
-            store.clear_index()?;
-            safe_println!("File indexes cleared successfully.");
+        Store::delete_database(home.join("db").as_path())?;
+        safe_println!("Database cleared successfully.");
+        return Ok(());
+    }
+
+    if let Some(Commands::Complete {
+        offset,
+        point,
+        wordbreaks,
+        shell,
+        query,
+    }) = &cli.command
+    {
+        let home = ttfm::get_ttfm_home()?;
+        let db_dir = home.join("db");
+        if !db_dir.exists() {
+            return Ok(());
         }
+        let registry = TagRegistry::with_standard();
+        let store = open_store_and_initialize(&db_dir, &registry)?;
+        let line = query.join(" ");
+        let default_wb = ttfm::cli::shell_completion::BASH_DEFAULT_WORDBREAKS;
+        let candidates = ttfm::cli::shell_completion::shell_candidates(
+            &store,
+            &registry,
+            &line,
+            point.unwrap_or(line.len()),
+            wordbreaks.as_deref().unwrap_or(default_wb),
+            *shell,
+            offset.unwrap_or(0),
+            10,
+        );
+        for c in candidates {
+            println!("{c}");
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::Clear { all: false }) = cli.command {
+        let home = ttfm::get_ttfm_home()?;
+        let store = Store::open(home.join("db"))?;
+        store.clear_index()?;
+        safe_println!("File indexes cleared successfully.");
         return Ok(());
     }
 
@@ -69,9 +114,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         registry.load_builtins(&config.plugins.status)?;
     }
 
-    let store = Store::open(home.join("db"))?;
-    ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    registry.load_type_configs(&store)?;
+    let store = open_store_and_initialize(&home.join("db"), &registry)?;
 
     let write_opts = build_write_options(&cli, &config);
 
@@ -224,6 +267,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Err("decal は未実装です".into());
             }
             Commands::Clear { .. } => unreachable!("Handled early"),
+            Commands::Complete { .. } => unreachable!("Handled early"),
             Commands::Note { content } => {
                 let id = ttfm::tagging::add_item(
                     &store, &registry, "note", content,

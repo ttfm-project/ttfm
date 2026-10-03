@@ -182,9 +182,13 @@ mod tests {
         let resolver =
             Resolver::new_nowarn("extension:rs", &TagRegistry::with_standard())
                 .unwrap();
-        let sql = PickNode::new(&Src::OneView, &resolver.resolved_query)
-            .build_pick()
-            .to_string(PostgresQueryBuilder);
+        let sql = PickNode::new(
+            &Src::OneView,
+            &resolver.resolved_query,
+            &resolver.definition_storage,
+        )
+        .build_pick()
+        .to_string(PostgresQueryBuilder);
 
         assert!(
             sql.contains("\"rank\""),
@@ -214,9 +218,13 @@ mod tests {
             &TagRegistry::with_standard(),
         )
         .unwrap();
-        let sql = PickNode::new(&Src::OneView, &resolver.resolved_query)
-            .build_pick()
-            .to_string(PostgresQueryBuilder);
+        let sql = PickNode::new(
+            &Src::OneView,
+            &resolver.resolved_query,
+            &resolver.definition_storage,
+        )
+        .build_pick()
+        .to_string(PostgresQueryBuilder);
 
         assert!(
             sql.contains("INTERSECT"),

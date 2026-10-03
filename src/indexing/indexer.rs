@@ -197,7 +197,7 @@ impl<'a> Indexer<'a> {
             |_data| Ok(()),
         )?;
 
-        if !self.store.tags_metadata_path().exists() {
+        if !self.store.is_indexed() {
             crate::db::tags::generate_tags_hive_partitioned(
                 &self.store,
                 &self.store.conn,
@@ -219,6 +219,11 @@ impl<'a> Indexer<'a> {
                     &types_vec,
                 )?;
             }
+        }
+
+        let complete_path = self.store.complete_path();
+        if !complete_path.exists() {
+            std::fs::File::create(&complete_path)?;
         }
 
         Ok(count)

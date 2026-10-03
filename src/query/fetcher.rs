@@ -150,6 +150,7 @@ impl<'a> Fetcher<'a> {
         let pick = crate::query::sql::PickNode::new(
             &Src::OneView,
             &self.resolver.resolved_query,
+            &self.resolver.definition_storage,
         );
         let select_sql = crate::query::sql::build_flat_table_sql(
             &Src::OneView,
@@ -176,7 +177,11 @@ impl<'a> Fetcher<'a> {
         path: &Path,
         metadata: Option<&HashMap<String, String>>,
     ) -> Result<()> {
-        let pick = PickNode::new(&Src::OneView, &self.resolver.resolved_query);
+        let pick = PickNode::new(
+            &Src::OneView,
+            &self.resolver.resolved_query,
+            &self.resolver.definition_storage,
+        );
         let select_sql = crate::query::sql::build_flat_table_sql(
             &Src::OneView,
             &pick,

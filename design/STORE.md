@@ -51,17 +51,22 @@ TTFMのデータベースは以下の様式で定義される。
 - `removed_at`: 削除を検知した日時 (epoch)
 
 ### 1.6 `tags` Table
-- **ファイルパス**: `.ttfm/db/tags/type=<type>/*.parquet`（内部保存形式として Hive パーティション分割ディレクトリを使用）
+- **ファイルパス**: `.ttfm/db/tags/origin=<origin>/type=<type>/*.parquet`（内部保存形式として origin と型による Hive パーティション分割ディレクトリを使用）
 - タグ候補の高速ルックアップ用辞書テーブル。
+- `oneview` から得られるタグのキャッシュであり、独自の意味を持たない。
+- 各行は元データの origin に置く: `user_tags` は user、`base_tags` / `tags_by_location` / `file_references` は file、他タグから導出した行は導出元の origin、未使用の登録済みタグ定義は item_id 区画の origin。
+- `origin=file` はインデックスで生成され、編集時は `.index_complete` 存在時のみ更新される。その他の origin はインデックスの有無に関係なく編集時に作成・更新される。
+- `.ttfm/db/.index_complete`: `origin=file` の有効性を示すマーカーファイル。インデックス完了時に作成され、`ttfm clear` で削除される。`Store::is_indexed()` は状態を保持せず毎回ファイルの有無を確認する。
+- 読み出し: 辞書全体を読み、`type` / `origin` で絞り込み、型・タグの重複を除去する。物理順スキャンは対象の型が 1 つの origin にのみ存在する場合に行う。
+- 定義検索の origin 判定: `origin:X` は `origin=X` に存在する値。
 - カラム構成:
   - `type` (VARCHAR): タグ型名
   - `label` (VARCHAR): 文字列化ラベル値
   - `tag` (VARCHAR): `type:label` 完全文字列
   - `item_id` (BIGINT, NULLABLE): 登録済み定義アイテムの Stored ID
   - `rank` (BIGINT): タグ・型の優先度
-- 完了標識: `.ttfm/db/tags/metadata.parquet` (KV_METADATA: ttfm.status = complete)
-- 読み出し時: `read_parquet('tags/*/*.parquet', hive_partitioning = true) WHERE type = ?`
-- 各パーティション内ソート: `rank DESC, label ASC, item_id ASC`
+  - `is_attached` (BOOLEAN): アイテムへの実付与タグであるか（実付与は true、未付与登録定義は false）
+- 保存時のソート: `rank DESC, label ASC, item_id ASC`
 
 ## 2. Item Store (Definition Registry)
 タグの型(Type)や値(Label)の定義自体を管理するID台帳。
@@ -130,7 +135,7 @@ StorageMapping は3種:
 |---|---|---|
 | **Fixed(col)** | 専用カラム（`item_kind` / `content` 等） | 対象 item の物理テーブルの当該カラムを更新（`item_references` の `item_kind` / `content` は `item_references`） |
 | **Basic{column, tag_type}** | 汎用ラベルカラム（`label_str` / `label_int` / `label_double` / `label_bool`）＋ `type` | `user_tags` に行を追加/削除（`type` = tag_type、値を型に応じた `label_*` カラムへ） |
-| **Composite** | 他タグへ展開される論理タグ（`directory:` 等） | 直接の格納先を持たず、展開先の各タグの write へ委ねる |
+| **Composite** | 他タグへ展開される論理タグ（`directory:` 等）。定義アイテムについては、indexing時に展開先ソースと `implies()` から導出したラベルをtags tableに実体化する | 直接の格納先を持たず、展開先の各タグの write へ委ねる |
 
 - **書き込み先テーブルは origin で決まる**: ユーザー編集は常に `user_tags`（または Fixed の専用カラム）。
   `base_tags` / `tags_by_location` / `system_tags` は `ttfm index` 専管で、編集の write 対象外。

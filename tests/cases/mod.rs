@@ -440,6 +440,7 @@ pub(super) fn inject_path_scope(query: &str, dir: &Path) -> String {
 // ──────────────────────────────────────────────
 
 pub mod cache_paged_test;
+pub mod completion;
 pub mod identifier_test;
 pub mod indexing_integration;
 pub mod integration_tags;
@@ -454,6 +455,7 @@ mod test_chain_comparison;
 pub mod test_computation_fetching;
 pub mod test_confirm;
 pub mod test_date_regression;
+pub mod test_definition_short_bench;
 pub mod test_discrepancy;
 pub mod test_edit;
 pub mod test_errors;

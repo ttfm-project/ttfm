@@ -290,7 +290,7 @@ pub fn parquet_query(path: &str) -> SelectStatement {
 pub fn hive_parquet_query(dir: &Path) -> SelectStatement {
     use crate::db::{DuckDbFunc, Pronoun::*};
     use sea_query::Func;
-    let glob = dir.join("*/*.parquet");
+    let glob = dir.join("*/*/*.parquet");
     Query::select()
         .column(sea_query::Asterisk)
         .from_function(
@@ -435,6 +435,38 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
         Ok(p) => p.matches(text),
         Err(_) => pattern == text,
     }
+}
+
+pub struct PathWord {
+    pub start: usize,
+    pub text: String,
+}
+
+pub fn split_path_words(s: &str) -> Vec<PathWord> {
+    let mut words = Vec::new();
+    let mut current: Option<PathWord> = None;
+    let mut in_quote = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                current.get_or_insert(PathWord {
+                    start: i,
+                    text: String::new(),
+                });
+            }
+            c if c.is_whitespace() && !in_quote => words.extend(current.take()),
+            c => current
+                .get_or_insert(PathWord {
+                    start: i,
+                    text: String::new(),
+                })
+                .text
+                .push(c),
+        }
+    }
+    words.extend(current);
+    words
 }
 
 // ========================================================

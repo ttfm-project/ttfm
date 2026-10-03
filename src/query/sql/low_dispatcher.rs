@@ -25,13 +25,14 @@ use super::{
     build_scalar_match_sql,
 };
 use crate::db::Src;
-use crate::query::lens_resolver::ResolvedNode;
+use crate::query::lens_resolver::{DefinitionStorage, ResolvedNode};
 use sea_query::SelectStatement;
 
 pub(super) fn try_dispatch_common(
     src: &Src,
     node: &ResolvedNode,
     child_sqls: Vec<SelectStatement>,
+    storage: &DefinitionStorage,
 ) -> Result<SelectStatement, Vec<SelectStatement>> {
     match node {
         ResolvedNode::And(_) => Ok(build_resolved_and_sql(src, child_sqls)),
@@ -53,7 +54,7 @@ pub(super) fn try_dispatch_common(
             Ok(build_column_match_in_sql(src, *target_col, labels))
         }
         ResolvedNode::DefinitionRef { def, .. } => {
-            Ok(super::definition::build_definition_pick_sql(src, def))
+            Ok(super::definition::build_definition_pick_sql(def, storage))
         }
         ResolvedNode::Match {
             storage,

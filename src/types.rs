@@ -1648,6 +1648,7 @@ pub enum SType {
     ScanHash,
     BasenameScanHash,
     TypedTag,
+    IsAttached,
     // 検索専用仮想タグ
     Directory,
     // Typed Label Columns
@@ -1706,6 +1707,7 @@ impl SType {
             Self::ScanHash => "scan_hash",
             Self::BasenameScanHash => "basename_scan_hash",
             Self::TypedTag => "tag",
+            Self::IsAttached => "is_attached",
             Self::Directory => "directory",
             Self::LabelStr => "label_str",
             Self::LabelInt => "label_int",
@@ -1768,6 +1770,7 @@ impl std::str::FromStr for SType {
             "scan_hash" => Ok(Self::ScanHash),
             "basename_scan_hash" => Ok(Self::BasenameScanHash),
             "tag" => Ok(Self::TypedTag),
+            "is_attached" => Ok(Self::IsAttached),
             "directory" => Ok(Self::Directory),
             "label_str" => Ok(Self::LabelStr),
             "label_int" => Ok(Self::LabelInt),

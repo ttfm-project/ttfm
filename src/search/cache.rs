@@ -173,6 +173,13 @@ impl Drop for TmpCleanupGuard {
     }
 }
 
+fn attach_store_tags_dir(
+    resolver: crate::query::lens_resolver::Resolver,
+    store: &Store,
+) -> crate::query::lens_resolver::Resolver {
+    resolver.with_store(store)
+}
+
 pub fn run_cache_worker(db_dir: PathBuf, cid: &str, query: &str) -> Result<()> {
     let cache = CacheManager::new(db_dir.join("cache"), 0);
     let cache_path = cache.path_for(cid);
@@ -216,11 +223,14 @@ pub fn run_cache_worker(db_dir: PathBuf, cid: &str, query: &str) -> Result<()> {
     let parsed = crate::query::parser::parse_nowarn(query)?;
     let expanded =
         super::eval::expand_eval(parsed, &store, &registry, &mut Vec::new())?;
-    let resolver = crate::query::lens_resolver::Resolver::from_node(
-        expanded,
-        &registry,
-        &mut Vec::new(),
-    )?;
+    let resolver = attach_store_tags_dir(
+        crate::query::lens_resolver::Resolver::from_node(
+            expanded,
+            &registry,
+            &mut Vec::new(),
+        )?,
+        &store,
+    );
     let fetcher = crate::query::fetcher::Fetcher::new(&resolver, &store.conn);
     let mut metadata = HashMap::new();
     metadata.insert(META_QUERY.to_string(), query.to_string());
@@ -396,10 +406,13 @@ pub(crate) fn try_resolve_cache(
     }
     let parsed = crate::query::parser::parse(query, sink)?;
     let expanded = super::eval::expand_eval(parsed, store, registry, sink)?;
-    let resolver = crate::query::lens_resolver::Resolver::from_node(
-        expanded, registry, sink,
-    )?
-    .with_order(&options.order);
+    let resolver = attach_store_tags_dir(
+        crate::query::lens_resolver::Resolver::from_node(
+            expanded, registry, sink,
+        )?
+        .with_order(&options.order),
+        store,
+    );
     let fetcher = crate::query::fetcher::Fetcher::new(&resolver, &store.conn);
     let src = crate::db::Src::Parquet(cache_path.to_string_lossy().to_string());
     let mut results = match fetcher.fetch_from(&src, n, offset) {
@@ -433,6 +446,7 @@ mod tests {
     use super::*;
     use crate::indexing::Indexer;
     use crate::search::search_nowarn;
+    use crate::types::Origin;
     use std::fs::File;
     use tempfile::tempdir;
 
@@ -873,6 +887,54 @@ mod tests {
         assert!(names.contains(&"readme.md".to_string()));
         assert!(names.contains(&"test.rs".to_string()));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_cache_generation_and_read_use_tags_dictionary() -> Result<()> {
+        let dir = tempdir()?;
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir)?;
+        let (store, registry, _cache) = setup(&db_dir)?;
+        let project = store.tags_origin_dir(Origin::User).join("type=project");
+        std::fs::create_dir_all(&project)?;
+        std::fs::File::create(project.join("data.parquet"))?;
+        std::fs::File::create(store.complete_path())?;
+        let base = crate::query::lens_resolver::Resolver::new_nowarn(
+            "tag:\"project:a*\" & filename:*",
+            &registry,
+        )?;
+        let resolver = super::attach_store_tags_dir(base, &store);
+        let sql = crate::query::sql::build_fetch_sql(
+            &crate::db::Src::OneView,
+            &resolver,
+            10,
+            0,
+        )?
+        .to_string(PostgresQueryBuilder);
+        assert!(
+            sql.contains("hive_partitioning") || sql.contains("type=project"),
+            "{sql}"
+        );
+        assert!(!sql.contains("user_tags"), "{sql}");
+        let fetched = crate::query::lens_resolver::Resolver::from_node(
+            crate::query::parser::parse_nowarn("count(tag:\"project:a*\")")?,
+            &registry,
+            &mut Vec::new(),
+        )?;
+        let fetched = super::attach_store_tags_dir(fetched, &store);
+        let count_sql = crate::query::sql::build_fetch_sql(
+            &crate::db::Src::OneView,
+            &fetched,
+            0,
+            0,
+        )?
+        .to_string(PostgresQueryBuilder);
+        assert!(
+            count_sql.contains("hive_partitioning")
+                || count_sql.contains("type=project"),
+            "{count_sql}"
+        );
         Ok(())
     }
 }

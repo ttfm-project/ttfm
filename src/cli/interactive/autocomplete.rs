@@ -15,83 +15,332 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::cli::interactive::state::State;
-use reedline::{Completer, Hinter, History, Span, Suggestion};
+use reedline::{Hinter, History};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-pub struct InteractiveHinter {
-    state: Arc<Mutex<State>>,
-    last_indexed_path: Arc<Mutex<String>>,
-    current_line: Arc<Mutex<String>>,
-    current_hint: String,
-    edited: bool,
-    transient_message: Arc<Mutex<Option<(String, std::time::Instant)>>>,
+pub use crate::autocomplete::*;
+
+pub const DEFAULT_QUERY: &str = "*:*";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompletionPhase {
+    #[default]
+    Off,
+    GhostActive,
+    MenuPaging,
 }
 
-impl InteractiveHinter {
-    pub fn new(
-        state: Arc<Mutex<State>>,
-        last_indexed_path: Arc<Mutex<String>>,
-    ) -> Self {
-        Self {
-            state,
-            last_indexed_path,
-            current_line: Arc::new(Mutex::new(String::new())),
-            current_hint: String::new(),
-            edited: false,
-            transient_message: Arc::new(Mutex::new(None)),
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CompletionState {
+    phase: CompletionPhase,
+    menu_base_line: String,
+    menu_base_pos: usize,
+    suppressed: bool,
+}
+
+impl CompletionState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn phase(&self) -> CompletionPhase {
+        self.phase
+    }
+
+    pub fn is_suppressed(&self) -> bool {
+        self.suppressed
+    }
+
+    pub fn menu_base(&self) -> Option<(String, usize)> {
+        if self.phase == CompletionPhase::MenuPaging {
+            Some((self.menu_base_line.clone(), self.menu_base_pos))
+        } else {
+            None
         }
     }
 
-    pub fn with_current_line(
-        state: Arc<Mutex<State>>,
-        last_indexed_path: Arc<Mutex<String>>,
-        current_line: Arc<Mutex<String>>,
-    ) -> Self {
-        Self {
-            state,
-            last_indexed_path,
-            current_line,
-            current_hint: String::new(),
-            edited: false,
-            transient_message: Arc::new(Mutex::new(None)),
+    pub fn enter_ghost(&mut self) {
+        if self.phase == CompletionPhase::MenuPaging {
+            return;
+        }
+        self.phase = CompletionPhase::GhostActive;
+    }
+
+    pub fn enter_menu(&mut self, line: String, pos: usize) {
+        self.phase = CompletionPhase::MenuPaging;
+        self.menu_base_line = line;
+        self.menu_base_pos = pos;
+        self.suppressed = false;
+    }
+
+    pub fn clear_ghost(&mut self) {
+        if self.phase == CompletionPhase::GhostActive {
+            self.phase = CompletionPhase::Off;
         }
     }
 
-    pub fn set_transient_message(&self, msg: &str) {
-        if let Ok(mut tm) = self.transient_message.lock() {
-            *tm = Some((msg.to_string(), std::time::Instant::now()));
-        }
+    pub fn set_off(&mut self) {
+        self.phase = CompletionPhase::Off;
     }
 
-    pub fn clear_transient_message(&self) {
-        if let Ok(mut tm) = self.transient_message.lock() {
-            *tm = None;
-        }
+    pub fn dismiss(&mut self) -> Option<(String, usize)> {
+        let restore = self.menu_base();
+        self.phase = CompletionPhase::Off;
+        self.suppressed = true;
+        restore
     }
 
-    pub fn transient_message_handle(
-        &self,
-    ) -> Arc<Mutex<Option<(String, std::time::Instant)>>> {
-        self.transient_message.clone()
-    }
-
-    pub fn current_line(&self) -> Arc<Mutex<String>> {
-        self.current_line.clone()
+    pub fn unsuppress(&mut self) {
+        self.suppressed = false;
     }
 
     pub fn reset(&mut self) {
-        self.edited = false;
-        self.current_hint.clear();
-        self.clear_transient_message();
-        if let Ok(mut cur) = self.current_line.lock() {
-            cur.clear();
+        *self = Self::default();
+    }
+}
+
+pub struct InteractiveHinter {
+    current_line: String,
+    transient_message: Option<(String, Instant)>,
+    ghost_slot: Option<String>,
+    last_query: String,
+    last_path: String,
+    last_computed_hint: String,
+    completion: Arc<Mutex<CompletionState>>,
+    candidate_source:
+        Option<Arc<dyn Fn(&str, usize) -> Vec<Candidate> + Send + Sync>>,
+}
+
+impl Default for InteractiveHinter {
+    fn default() -> Self {
+        Self {
+            current_line: String::new(),
+            transient_message: None,
+            ghost_slot: None,
+            last_query: DEFAULT_QUERY.to_string(),
+            last_path: ".".to_string(),
+            last_computed_hint: String::new(),
+            completion: Arc::new(Mutex::new(CompletionState::new())),
+            candidate_source: None,
         }
+    }
+}
+
+impl InteractiveHinter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_ghost(&mut self, ghost: Option<String>) {
+        self.ghost_slot = ghost;
+    }
+
+    pub fn set_last_query(&mut self, query: &str) {
+        self.last_query = query.to_string();
+    }
+
+    pub fn set_last_path(&mut self, path: &str) {
+        self.last_path = path.to_string();
+    }
+
+    pub fn completion_state(&self) -> Arc<Mutex<CompletionState>> {
+        Arc::clone(&self.completion)
+    }
+
+    pub fn set_completion_state(&mut self, state: Arc<Mutex<CompletionState>>) {
+        self.completion = state;
+    }
+
+    pub fn phase(&self) -> CompletionPhase {
+        self.with_state(|s| s.phase())
+            .unwrap_or(CompletionPhase::Off)
+    }
+
+    pub fn is_tracing(&self) -> bool {
+        self.phase() == CompletionPhase::GhostActive
+    }
+
+    pub fn is_trace_cancelled(&self) -> bool {
+        self.with_state(|s| s.is_suppressed()).unwrap_or(false)
+    }
+
+    pub fn set_candidate_source(
+        &mut self,
+        source: Arc<dyn Fn(&str, usize) -> Vec<Candidate> + Send + Sync>,
+    ) {
+        self.candidate_source = Some(source);
+    }
+
+    pub fn cancel_trace(&mut self) {
+        self.with_state_mut(|s| {
+            s.dismiss();
+        });
+        self.last_computed_hint.clear();
+        self.ghost_slot = None;
+    }
+
+    pub fn clear_active_hint(&mut self) {
+        self.with_state_mut(|s| s.set_off());
+        self.last_computed_hint.clear();
+        self.ghost_slot = None;
+    }
+
+    fn with_state<T>(
+        &self,
+        f: impl FnOnce(&CompletionState) -> T,
+    ) -> Option<T> {
+        self.completion.lock().ok().map(|s| f(&s))
+    }
+
+    fn with_state_mut<T>(
+        &self,
+        f: impl FnOnce(&mut CompletionState) -> T,
+    ) -> Option<T> {
+        self.completion.lock().ok().map(|mut s| f(&mut s))
+    }
+
+    pub fn set_transient_message(&mut self, msg: &str) {
+        self.transient_message = Some((msg.to_string(), Instant::now()));
+    }
+
+    pub fn clear_transient_message(&mut self) {
+        self.transient_message = None;
+    }
+
+    pub fn current_line(&self) -> &str {
+        &self.current_line
+    }
+
+    pub fn reset(&mut self) {
+        self.ghost_slot = None;
+        self.transient_message = None;
+        self.current_line.clear();
+        self.last_computed_hint.clear();
+        self.with_state_mut(|s| s.reset());
     }
 
     pub fn handle_line(&mut self, line: &str, pos: usize) -> String {
         let history = reedline::FileBackedHistory::default();
         self.handle(line, pos, &history, false, "")
+    }
+
+    fn quoted_last_path(&self) -> String {
+        if self.last_path.contains(' ') && !self.last_path.starts_with('"') {
+            format!("\"{}\"", self.last_path)
+        } else {
+            self.last_path.clone()
+        }
+    }
+
+    fn unique_suffix_from_source(
+        &self,
+        line: &str,
+        pos: usize,
+    ) -> Option<String> {
+        let source = self.candidate_source.as_ref()?;
+        let cands = source(line, pos);
+        unique_ghost_suffix(line, pos, &cands)
+    }
+
+    fn hint_last_query_trace(&mut self, trimmed: &str) -> Option<String> {
+        if trimmed == "s" {
+            if self.last_query.is_empty() {
+                self.with_state_mut(|s| s.clear_ghost());
+                return Some(String::new());
+            }
+            self.with_state_mut(|s| s.enter_ghost());
+            return Some(format!(" {}", self.last_query));
+        }
+        let rest = trimmed.strip_prefix("s ")?;
+        if !self.is_tracing() {
+            return None;
+        }
+        match self.last_query.strip_prefix(rest) {
+            Some(suffix) if suffix.is_empty() => {
+                self.with_state_mut(|s| s.clear_ghost());
+                Some(String::new())
+            }
+            Some(suffix) => Some(suffix.to_string()),
+            None => None,
+        }
+    }
+
+    fn hint_index_path_trace(&mut self, trimmed: &str) -> Option<String> {
+        let quoted_path = self.quoted_last_path();
+        if trimmed == "i" {
+            self.with_state_mut(|s| s.enter_ghost());
+            return Some(format!(" {quoted_path}"));
+        }
+        let rest = trimmed.strip_prefix("i ")?;
+        if self.is_tracing() {
+            return match quoted_path.strip_prefix(rest) {
+                Some(suffix) if suffix.is_empty() => {
+                    self.with_state_mut(|s| s.clear_ghost());
+                    Some(String::new())
+                }
+                Some(suffix) => Some(suffix.to_string()),
+                None => {
+                    self.with_state_mut(|s| s.clear_ghost());
+                    Some(String::new())
+                }
+            };
+        }
+        if rest.is_empty() {
+            self.with_state_mut(|s| s.enter_ghost());
+            return Some(quoted_path);
+        }
+        None
+    }
+
+    fn hint_edit_query_trace(&mut self, trimmed: &str) -> Option<String> {
+        if trimmed != "t" && trimmed != "u" {
+            return None;
+        }
+        if self.last_query.is_empty() {
+            self.with_state_mut(|s| s.clear_ghost());
+            return Some(String::new());
+        }
+        self.with_state_mut(|s| s.enter_ghost());
+        let escaped = self.last_query.replace('"', "\\\"");
+        Some(format!(" \"{escaped}\" "))
+    }
+
+    fn compute_hint_suffix(&mut self, line: &str, pos: usize) -> String {
+        if pos != line.len() {
+            return String::new();
+        }
+        if self.phase() == CompletionPhase::MenuPaging {
+            return String::new();
+        }
+        let trimmed = line.trim_start();
+        if self.is_trace_cancelled() {
+            if trimmed == "s "
+                || trimmed == "i "
+                || trimmed == "t "
+                || trimmed == "u "
+            {
+                self.with_state_mut(|s| s.unsuppress());
+            } else {
+                return String::new();
+            }
+        }
+        if let Some(hint) = self.hint_last_query_trace(trimmed) {
+            return hint;
+        }
+        if let Some(hint) = self.hint_index_path_trace(trimmed) {
+            return hint;
+        }
+        if let Some(hint) = self.hint_edit_query_trace(trimmed) {
+            return hint;
+        }
+        if self.phase() == CompletionPhase::GhostActive {
+            if let Some(suffix) = self.unique_suffix_from_source(line, pos) {
+                return suffix;
+            }
+            self.with_state_mut(|s| s.clear_ghost());
+        }
+        String::new()
     }
 }
 
@@ -99,203 +348,75 @@ impl Hinter for InteractiveHinter {
     fn handle(
         &mut self,
         line: &str,
-        _pos: usize,
+        pos: usize,
         _history: &dyn History,
         use_ansi_coloring: bool,
         _cwd: &str,
     ) -> String {
-        if let Ok(mut tm) = self.transient_message.lock() {
-            if let Some((msg, instant)) = tm.as_ref() {
-                if instant.elapsed() < std::time::Duration::from_millis(1500) {
-                    return if use_ansi_coloring {
-                        format!("\x1b[2m{msg}\x1b[0m")
-                    } else {
-                        msg.clone()
-                    };
+        self.current_line = line.to_string();
+
+        if let Some((msg, instant)) = self.transient_message.as_ref() {
+            if instant.elapsed() < std::time::Duration::from_millis(1500) {
+                return if use_ansi_coloring {
+                    format!("\x1b[2m{msg}\x1b[0m")
                 } else {
-                    *tm = None;
-                }
+                    msg.clone()
+                };
+            } else {
+                self.transient_message = None;
             }
         }
 
-        if let Ok(mut cur) = self.current_line.lock() {
-            *cur = line.to_string();
-        }
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            self.edited = false;
-            self.current_hint.clear();
+        if pos != line.len() {
             return String::new();
         }
 
-        let is_prefix = matches!(
-            trimmed,
-            "s" | "s " | "t" | "t " | "u" | "u " | "i" | "i "
-        );
-        if !is_prefix {
-            self.edited = true;
-        }
+        let hint = self.compute_hint_suffix(line, pos);
+        self.last_computed_hint = hint.clone();
 
-        self.current_hint.clear();
-        if self.edited {
-            return String::new();
-        }
-
-        if trimmed == "s" || trimmed == "s " {
-            if let Ok(st) = self.state.lock() {
-                let q = st.last_query().unwrap_or("*:*");
-                self.current_hint = if trimmed == "s" {
-                    format!(" {q}")
+        if let Some(ref ghost) = self.ghost_slot {
+            if !ghost.is_empty() {
+                return if use_ansi_coloring {
+                    format!("\x1b[2m{ghost}\x1b[0m")
                 } else {
-                    q.to_string()
+                    ghost.clone()
                 };
             }
-        } else if trimmed == "t"
-            || trimmed == "t "
-            || trimmed == "u"
-            || trimmed == "u "
-        {
-            if let Ok(st) = self.state.lock() {
-                if let Some(q) = st.last_query() {
-                    let escaped = q.replace('"', "\\\"");
-                    self.current_hint = if trimmed == "t" || trimmed == "u" {
-                        format!(" \"{escaped}\" ")
-                    } else {
-                        format!("\"{escaped}\" ")
-                    };
-                }
-            }
-        } else if trimmed == "i" || trimmed == "i " {
-            if let Ok(st) = self.state.lock() {
-                if matches!(*st, State::Init) {
-                    if let Ok(p) = self.last_indexed_path.lock() {
-                        let hint_str = if p.contains(char::is_whitespace) {
-                            format!("\"{p}\"")
-                        } else {
-                            p.clone()
-                        };
-                        self.current_hint = if trimmed == "i" {
-                            format!(" {hint_str}")
-                        } else {
-                            hint_str
-                        };
-                    }
-                }
-            }
         }
-        if use_ansi_coloring && !self.current_hint.is_empty() {
-            format!("\x1b[2m{}\x1b[0m", self.current_hint)
+
+        if hint.is_empty() {
+            String::new()
+        } else if use_ansi_coloring {
+            format!("\x1b[2m{hint}\x1b[0m")
         } else {
-            self.current_hint.clone()
+            hint
         }
     }
 
     fn complete_hint(&self) -> String {
-        self.current_hint.clone()
+        if let Some(ref ghost) = self.ghost_slot {
+            if !ghost.is_empty() {
+                return ghost.clone();
+            }
+        }
+        self.last_computed_hint.clone()
     }
 
     fn next_hint_token(&self) -> String {
-        self.current_hint
+        if let Some(ref ghost) = self.ghost_slot {
+            if !ghost.is_empty() {
+                return ghost
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+        self.last_computed_hint
             .split_whitespace()
             .next()
             .unwrap_or("")
             .to_string()
-    }
-}
-
-fn expand_tilde(path: &str) -> std::path::PathBuf {
-    if path == "~" {
-        dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("~"))
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            home.join(rest)
-        } else {
-            std::path::PathBuf::from(path)
-        }
-    } else {
-        std::path::PathBuf::from(path)
-    }
-}
-
-pub struct InteractiveCompleter {
-    state: Arc<Mutex<State>>,
-}
-
-impl InteractiveCompleter {
-    pub fn new(state: Arc<Mutex<State>>) -> Self {
-        Self { state }
-    }
-}
-
-impl Completer for InteractiveCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
-        if let Ok(st) = self.state.lock() {
-            if !matches!(*st, State::Init) {
-                return vec![];
-            }
-        }
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("i ") && pos >= 2 {
-            let prefix_offset = line.len() - trimmed.len() + 2;
-            if pos >= prefix_offset {
-                let sub = &line[prefix_offset..pos];
-                let last_word_offset = sub
-                    .char_indices()
-                    .rfind(|(_, c)| c.is_whitespace())
-                    .map(|(i, c)| i + c.len_utf8())
-                    .unwrap_or(0);
-                let word = &sub[last_word_offset..];
-                if word == "~" {
-                    let total_offset = prefix_offset + last_word_offset;
-                    return vec![Suggestion {
-                        value: "~/".to_string(),
-                        span: Span::new(total_offset, total_offset + 1),
-                        append_whitespace: false,
-                        ..Default::default()
-                    }];
-                }
-
-                let (dir_path, file_prefix) = match word.rfind('/') {
-                    Some(idx) => (&word[..=idx], &word[idx + 1..]),
-                    None => ("", word),
-                };
-                let read_dir_path = if dir_path.is_empty() {
-                    std::path::PathBuf::from(".")
-                } else {
-                    expand_tilde(dir_path)
-                };
-                let mut suggestions = Vec::new();
-                if let Ok(entries) = std::fs::read_dir(read_dir_path) {
-                    for entry in entries.flatten() {
-                        let name =
-                            entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with(file_prefix) {
-                            let is_dir = entry
-                                .file_type()
-                                .map(|t| t.is_dir())
-                                .unwrap_or(false);
-                            let mut val = format!("{}{}", dir_path, name);
-                            if is_dir {
-                                val.push('/');
-                            }
-                            let total_offset = prefix_offset + last_word_offset;
-                            suggestions.push(Suggestion {
-                                value: val,
-                                span: Span::new(
-                                    total_offset,
-                                    total_offset + word.len(),
-                                ),
-                                append_whitespace: !is_dir,
-                                ..Default::default()
-                            });
-                        }
-                    }
-                }
-                suggestions.sort_by(|a, b| a.value.cmp(&b.value));
-                return suggestions;
-            }
-        }
-        vec![]
     }
 }
 
@@ -304,114 +425,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hinter_quoted_output_for_tags() {
-        let state = Arc::new(Mutex::new(State::new()));
-        let path = Arc::new(Mutex::new(".".to_string()));
-        let mut hinter = InteractiveHinter::new(state.clone(), path);
-
-        assert_eq!(hinter.handle_line("t ", 2), "");
-        state.lock().unwrap().to_searched(
-            "ext:rs & fn:\"a b\"".to_string(),
-            None,
-            10,
-            Some(10),
-            false,
-        );
-        assert_eq!(hinter.handle_line("t ", 2), "\"ext:rs & fn:\\\"a b\\\"\" ");
-        assert_eq!(hinter.complete_hint(), "\"ext:rs & fn:\\\"a b\\\"\" ");
-        assert_eq!(hinter.next_hint_token(), "\"ext:rs");
-    }
-
-    #[test]
-    fn test_hinter_edited_clears_hint() {
-        let state = Arc::new(Mutex::new(State::new()));
-        let path = Arc::new(Mutex::new(".".to_string()));
-        let mut hinter = InteractiveHinter::new(state.clone(), path);
-
-        state.lock().unwrap().to_searched(
-            "ext:rs".to_string(),
-            None,
-            10,
-            Some(10),
-            false,
-        );
-        assert_eq!(hinter.handle_line("s ", 2), "ext:rs");
-
-        // 文字を入力すると edited に設定される
-        assert_eq!(hinter.handle_line("s a", 3), "");
-
-        // プレフィックスまで戻しても edited のためヒントは非表示を維持
-        assert_eq!(hinter.handle_line("s ", 2), "");
-        assert_eq!(hinter.complete_hint(), "");
-
-        // 空行でリセットされる
-        assert_eq!(hinter.handle_line("", 0), "");
-        assert_eq!(hinter.handle_line("s ", 2), "ext:rs");
-    }
-
-    #[test]
-    fn test_hinter_quoted_path_with_spaces() {
-        let state = Arc::new(Mutex::new(State::new()));
-        let path = Arc::new(Mutex::new("dir with spaces".to_string()));
-        let mut hinter = InteractiveHinter::new(state.clone(), path);
-        assert_eq!(hinter.handle_line("i ", 2), "\"dir with spaces\"");
-    }
-
-    #[test]
-    fn test_completer_span_offset_calculation() {
-        let state = Arc::new(Mutex::new(State::new()));
-        let mut completer = InteractiveCompleter::new(state);
-        let suggestions = completer.complete("i src/m", 7);
-        assert!(!suggestions.is_empty());
-        assert!(suggestions.iter().any(|s| s.value.starts_with("src/m")));
-        for s in &suggestions {
-            assert_eq!(s.span, Span::new(2, 7));
-        }
-    }
-
-    #[test]
-    fn test_completer_tilde_expansion() {
-        let state = Arc::new(Mutex::new(State::new()));
-        let mut completer = InteractiveCompleter::new(state);
-        let sugg = completer.complete("i ~", 3);
-        assert!(sugg.iter().any(|s| s.value == "~/"));
-        let sugg_slash = completer.complete("i ~/", 4);
-        assert!(!sugg_slash.is_empty());
-    }
-
-    #[test]
-    fn test_hinter_initial_default_query() {
-        let state = Arc::new(Mutex::new(State::new()));
-        let path = Arc::new(Mutex::new(".".to_string()));
-        let mut hinter = InteractiveHinter::new(state, path);
-        assert_eq!(hinter.handle_line("s ", 2), "*:*");
-        assert_eq!(hinter.handle_line("s", 1), " *:*");
-    }
-
-    #[test]
-    fn test_hinter_tracks_current_line() {
-        let state = Arc::new(Mutex::new(State::new()));
-        let path = Arc::new(Mutex::new(".".to_string()));
-        let mut hinter = InteractiveHinter::new(state, path);
-        assert_eq!(*hinter.current_line().lock().unwrap(), "");
-        hinter.handle_line("s foo", 5);
-        assert_eq!(*hinter.current_line().lock().unwrap(), "s foo");
-        hinter.reset();
-        assert_eq!(*hinter.current_line().lock().unwrap(), "");
-    }
-
-    #[test]
     fn test_hinter_ansi_coloring_applies_dimmed_style() {
-        let state = Arc::new(Mutex::new(State::new()));
-        let path = Arc::new(Mutex::new(".".to_string()));
-        let mut hinter = InteractiveHinter::new(state.clone(), path);
-        state.lock().unwrap().to_searched(
-            "ext:rs".to_string(),
-            None,
-            10,
-            Some(10),
-            false,
-        );
+        let mut hinter = InteractiveHinter::new();
+        hinter.set_ghost(Some("ext:rs".to_string()));
+
         let history = reedline::FileBackedHistory::default();
         let uncolored = hinter.handle("s ", 2, &history, false, "");
         assert_eq!(uncolored, "ext:rs");
@@ -423,19 +440,138 @@ mod tests {
     }
 
     #[test]
-    fn test_hinter_transient_message() {
-        let state = Arc::new(Mutex::new(State::new()));
-        let path = Arc::new(Mutex::new(".".to_string()));
-        let mut hinter = InteractiveHinter::new(state, path);
+    fn test_hinter_tracks_current_line() {
+        let mut hinter = InteractiveHinter::new();
+        assert_eq!(hinter.current_line(), "");
+        hinter.handle_line("s foo", 5);
+        assert_eq!(hinter.current_line(), "s foo");
+        hinter.reset();
+        assert_eq!(hinter.current_line(), "");
+    }
 
+    #[test]
+    fn test_hinter_transient_message() {
+        let mut hinter = InteractiveHinter::new();
         hinter.set_transient_message(" (no matches)");
         let history = reedline::FileBackedHistory::default();
         let colored = hinter.handle("s foo", 5, &history, true, "");
         assert_eq!(colored, "\x1b[2m (no matches)\x1b[0m");
 
-        // clear_transient_message で消える
         hinter.clear_transient_message();
         let cleared = hinter.handle("s foo", 5, &history, true, "");
         assert_eq!(cleared, "");
+    }
+
+    #[test]
+    fn test_hinter_complete_hint_and_next_token() {
+        let mut hinter = InteractiveHinter::new();
+        hinter.set_ghost(Some("\"ext:rs & fn:bar\"".to_string()));
+        assert_eq!(hinter.complete_hint(), "\"ext:rs & fn:bar\"");
+        assert_eq!(hinter.next_hint_token(), "\"ext:rs");
+    }
+
+    #[test]
+    fn test_completion_state_phase_transitions() {
+        let mut st = CompletionState::new();
+        assert_eq!(st.phase(), CompletionPhase::Off);
+
+        st.enter_ghost();
+        assert_eq!(st.phase(), CompletionPhase::GhostActive);
+
+        st.enter_menu("s ".into(), 2);
+        assert_eq!(st.phase(), CompletionPhase::MenuPaging);
+        assert_eq!(st.menu_base(), Some(("s ".into(), 2)));
+
+        st.enter_ghost();
+        assert_eq!(st.phase(), CompletionPhase::MenuPaging);
+
+        let restore = st.dismiss();
+        assert_eq!(restore, Some(("s ".into(), 2)));
+        assert_eq!(st.phase(), CompletionPhase::Off);
+        assert!(st.is_suppressed());
+        assert_eq!(st.menu_base(), None);
+
+        st.enter_ghost();
+        st.clear_ghost();
+        assert_eq!(st.phase(), CompletionPhase::Off);
+        st.set_off();
+        assert_eq!(st.phase(), CompletionPhase::Off);
+    }
+
+    #[test]
+    fn test_hinter_off_does_not_query_candidate_source() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let mut hinter = InteractiveHinter::new();
+        hinter.set_last_query("extension:rs");
+        hinter.set_candidate_source(Arc::new(move |_line, _pos| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+            vec![Candidate {
+                raw: "extension:".into(),
+                kind: CandidateKind::Type,
+                span: (2, 5),
+            }]
+        }));
+
+        assert_eq!(hinter.handle_line("s extra", 7), "");
+        assert_eq!(hinter.phase(), CompletionPhase::Off);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        assert_eq!(hinter.handle_line("s ext", 5), "");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_hinter_empty_last_query_shows_no_ghost() {
+        let mut hinter = InteractiveHinter::new();
+        hinter.set_last_query("extension:rs");
+        assert_eq!(hinter.handle_line("s", 1), " extension:rs");
+        hinter.set_last_query("");
+        assert_eq!(hinter.handle_line("s", 1), "");
+        assert_eq!(hinter.handle_line("t", 1), "");
+        assert_eq!(hinter.handle_line("u", 1), "");
+        assert_ne!(hinter.phase(), CompletionPhase::GhostActive);
+    }
+
+    #[test]
+    fn test_hinter_ghost_only_at_end_of_line() {
+        let mut hinter = InteractiveHinter::new();
+        hinter.set_last_query("extension:rs");
+        assert_eq!(hinter.handle_line("s", 1), " extension:rs");
+        assert_eq!(hinter.phase(), CompletionPhase::GhostActive);
+        assert_eq!(hinter.handle_line("s", 0), "");
+        assert_eq!(hinter.handle_line("s extension:rs", 5), "");
+    }
+
+    #[test]
+    fn test_hinter_unique_ghost_only_when_ghost_active() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let mut hinter = InteractiveHinter::new();
+        hinter.set_last_query("foo:bar");
+        hinter.set_candidate_source(Arc::new(move |line: &str, _pos| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+            if line == "s ext" {
+                vec![Candidate {
+                    raw: "extension:".into(),
+                    kind: CandidateKind::Type,
+                    span: (2, 5),
+                }]
+            } else {
+                vec![]
+            }
+        }));
+
+        assert_eq!(hinter.handle_line("s xyz", 5), "");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        hinter.completion_state().lock().unwrap().enter_ghost();
+        assert_eq!(hinter.handle_line("s ext", 5), "ension:");
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(hinter.phase(), CompletionPhase::GhostActive);
     }
 }

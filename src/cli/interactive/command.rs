@@ -18,7 +18,6 @@
 use std::fmt;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 use crate::cli::format::{
     format_tag_result, format_untag_result, print_results_with_options,
@@ -107,24 +106,11 @@ impl fmt::Display for CommandParseError {
 impl std::error::Error for CommandParseError {}
 
 pub fn parse_paths(rest: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    for c in rest.chars() {
-        match c {
-            '"' => in_quote = !in_quote,
-            c if c.is_whitespace() && !in_quote => {
-                if !current.is_empty() {
-                    paths.push(PathBuf::from(std::mem::take(&mut current)));
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        paths.push(PathBuf::from(current));
-    }
-    paths
+    crate::util::split_path_words(rest)
+        .into_iter()
+        .filter(|w| !w.text.is_empty())
+        .map(|w| PathBuf::from(w.text))
+        .collect()
 }
 
 pub fn parse_quoted_search_and_rest(
@@ -426,7 +412,7 @@ pub fn dispatch_command<R: BufRead, W: Write, E: Write>(
     registry: &TagRegistry,
     _config: &Config,
     write_options: WriteOptions,
-    last_indexed_path: &Arc<Mutex<String>>,
+    last_indexed_path: &mut String,
     input: &mut R,
     output: &mut W,
     err_out: &mut E,
@@ -635,9 +621,7 @@ pub fn dispatch_command<R: BufRead, W: Write, E: Write>(
             view.finish();
             writeln!(output, "Indexed {n} files.")?;
             if let Some(first) = paths.first() {
-                if let Ok(mut p) = last_indexed_path.lock() {
-                    *p = first.to_string_lossy().to_string();
-                }
+                *last_indexed_path = first.to_string_lossy().to_string();
             }
         }
         Command::ClearIndex { all } => {
@@ -665,6 +649,7 @@ pub fn dispatch_command<R: BufRead, W: Write, E: Write>(
                     writeln!(output, "Database cleared successfully.")?;
                 } else {
                     store.clear_index()?;
+                    Indexer::new(store, registry).initialize_tables()?;
                     writeln!(output, "File indexes cleared successfully.")?;
                 }
             } else {
@@ -682,6 +667,7 @@ pub fn dispatch_command<R: BufRead, W: Write, E: Write>(
         Command::Quit => {
             if matches!(*state, State::Searched { .. }) {
                 state.clear();
+                writeln!(output)?;
                 print_menu(output, state)?;
                 return Ok(true);
             }
@@ -729,6 +715,13 @@ Comparisons & Ranges:
 Eval (q()):
   s q(milestone:m1) & extension:rs \x1b[2m# Expand definition tags\x1b[0m
   t \"q(milestone:m1)\" status:ready \x1b[2m# Tag from definition\x1b[0m
+
+Key bindings:
+  Tab                 Show / cycle completion candidates (dynamic paging)
+  Shift+Tab / BackTab Cycle completion candidates backward
+  Enter               Submit command line (or accept ghost text if tracing)
+  Esc                 Cancel completion (keep line) / clear line / return
+  Right / Ctrl+F      Accept single ghost text token
 ";
 
 pub fn print_help<W: Write>(out: &mut W) -> std::io::Result<()> {
@@ -892,7 +885,7 @@ mod tests {
         let registry = TagRegistry::with_standard();
         let config = Config::default();
         let write_opts = WriteOptions::default();
-        let path = Arc::new(Mutex::new(".".to_string()));
+        let mut path = ".".to_string();
         let mut state = State::new();
         let mut input = std::io::Cursor::new(b"");
         let mut output = Vec::new();
@@ -905,7 +898,7 @@ mod tests {
             &registry,
             &config,
             write_opts,
-            &path,
+            &mut path,
             &mut input,
             &mut output,
             &mut err_out,
@@ -923,7 +916,7 @@ mod tests {
         let registry = TagRegistry::with_standard();
         let config = Config::default();
         let write_opts = WriteOptions::default();
-        let path = Arc::new(Mutex::new(".".to_string()));
+        let mut path = ".".to_string();
         let mut state = State::new();
         let mut input = std::io::Cursor::new(b"");
         let mut output = Vec::new();
@@ -936,7 +929,7 @@ mod tests {
             &registry,
             &config,
             write_opts,
-            &path,
+            &mut path,
             &mut input,
             &mut output,
             &mut err_out,
@@ -952,7 +945,7 @@ mod tests {
         let registry = TagRegistry::with_standard();
         let config = Config::default();
         let write_opts = WriteOptions::default();
-        let path = Arc::new(Mutex::new(".".to_string()));
+        let mut path = ".".to_string();
         let mut state = State::new();
         let mut input = std::io::Cursor::new(b"n\n");
         let mut output = Vec::new();
@@ -968,7 +961,7 @@ mod tests {
             &registry,
             &config,
             write_opts,
-            &path,
+            &mut path,
             &mut input,
             &mut output,
             &mut err_out,
@@ -983,7 +976,7 @@ mod tests {
         Indexer::new(&store, &registry).initialize_tables().unwrap();
         let config = Config::default();
         let write_opts = WriteOptions::default();
-        let path = Arc::new(Mutex::new(".".to_string()));
+        let mut path = ".".to_string();
         let mut state = State::new();
         let mut input = std::io::Cursor::new(b"");
         let mut output = Vec::new();
@@ -996,7 +989,7 @@ mod tests {
             &registry,
             &config,
             write_opts,
-            &path,
+            &mut path,
             &mut input,
             &mut output,
             &mut err_out,
@@ -1023,7 +1016,7 @@ mod tests {
         let config = Config::default();
         let mut write_opts = WriteOptions::default();
         write_opts.confirm = crate::config::ConfirmMode::Never;
-        let path = Arc::new(Mutex::new(".".to_string()));
+        let mut path = ".".to_string();
         let mut state = State::new();
 
         // 1. Initial search
@@ -1036,7 +1029,7 @@ mod tests {
             &registry,
             &config,
             write_opts.clone(),
-            &path,
+            &mut path,
             &mut std::io::Cursor::new(b""),
             &mut out1,
             &mut err1,
@@ -1057,7 +1050,7 @@ mod tests {
             &registry,
             &config,
             write_opts.clone(),
-            &path,
+            &mut path,
             &mut std::io::Cursor::new(b""),
             &mut out2,
             &mut err2,
@@ -1079,7 +1072,7 @@ mod tests {
             &registry,
             &config,
             write_opts,
-            &path,
+            &mut path,
             &mut std::io::Cursor::new(b""),
             &mut out3,
             &mut err3,
@@ -1117,7 +1110,7 @@ mod tests {
         Indexer::new(&store, &registry).initialize_tables().unwrap();
         let config = Config::default();
         let write_opts = WriteOptions::interactive();
-        let path = Arc::new(Mutex::new(".".to_string()));
+        let mut path = ".".to_string();
         let mut state = State::new();
         let mut input_cancel = std::io::Cursor::new(b"n\n");
         let mut output = Vec::new();
@@ -1130,7 +1123,7 @@ mod tests {
             &registry,
             &config,
             write_opts.clone(),
-            &path,
+            &mut path,
             &mut input_cancel,
             &mut output,
             &mut err_out,
@@ -1149,7 +1142,7 @@ mod tests {
             &registry,
             &config,
             write_opts,
-            &path,
+            &mut path,
             &mut input_yes,
             &mut output_yes,
             &mut err_out,
@@ -1242,7 +1235,7 @@ mod tests {
         let registry = TagRegistry::with_standard();
         let config = Config::default();
         let write_opts = WriteOptions::default();
-        let path = Arc::new(Mutex::new(".".to_string()));
+        let mut path = ".".to_string();
         let mut input = std::io::Cursor::new(b"");
         let mut output = Vec::new();
         let mut err_out = Vec::new();
@@ -1263,7 +1256,7 @@ mod tests {
             &registry,
             &config,
             write_opts.clone(),
-            &path,
+            &mut path,
             &mut input,
             &mut output,
             &mut err_out,
@@ -1271,6 +1264,12 @@ mod tests {
         .unwrap();
         assert!(cont);
         assert!(matches!(searched_state, State::Init));
+        let out_str = String::from_utf8(output.clone()).unwrap();
+        assert!(
+            out_str.starts_with("\nWelcome to ttfm interactive mode"),
+            "Expected output to start with a newline to separate from previous prompt, got: {:?}",
+            out_str
+        );
 
         let cont_init = dispatch_command(
             Command::Quit,
@@ -1279,7 +1278,7 @@ mod tests {
             &registry,
             &config,
             write_opts,
-            &path,
+            &mut path,
             &mut input,
             &mut output,
             &mut err_out,
@@ -1309,7 +1308,7 @@ mod tests {
         let config = Config::default();
         let mut write_opts = WriteOptions::default();
         write_opts.confirm = crate::config::ConfirmMode::Never;
-        let path = Arc::new(Mutex::new(".".to_string()));
+        let mut path = ".".to_string();
         let mut state = State::new();
         let mut input = std::io::Cursor::new(b"");
         let mut output = Vec::new();
@@ -1322,7 +1321,7 @@ mod tests {
             &registry,
             &config,
             write_opts,
-            &path,
+            &mut path,
             &mut input,
             &mut output,
             &mut err_out,
@@ -1352,7 +1351,7 @@ mod tests {
         let registry = TagRegistry::with_standard();
         let config = Config::default();
         let write_opts = WriteOptions::default();
-        let path = Arc::new(Mutex::new(".".to_string()));
+        let mut path = ".".to_string();
         let mut state = State::new();
         state.to_searched("dummy".to_string(), None, 0, Some(0), false);
 
@@ -1366,7 +1365,7 @@ mod tests {
             &registry,
             &config,
             write_opts.clone(),
-            &path,
+            &mut path,
             &mut std::io::Cursor::new(b""),
             &mut out_next,
             &mut err_next,
@@ -1385,7 +1384,7 @@ mod tests {
             &registry,
             &config,
             write_opts,
-            &path,
+            &mut path,
             &mut std::io::Cursor::new(b""),
             &mut out_prev,
             &mut err_prev,

@@ -133,27 +133,55 @@ pub(crate) fn count_types(
     Some(stmt)
 }
 
-/// 定義枝（複数可、Or 経由で到達可能なもの）が指す定義アイテムの distinct 件数の
-/// スカラー SQL。`defs` は DefinitionRef 以外を含んではならない
-/// （split_definition_branches の構築上、常にこの前提が成り立つ）。
+/// 純定義ノード（DefinitionRef / それらの Or / Difference）が指す
+/// 定義アイテムの distinct 件数のスカラー SQL。
 pub(crate) fn count_definitions(
-    src: &crate::db::Src,
+    _src: &crate::db::Src,
     defs: &[crate::query::lens_resolver::ResolvedNode],
+    storage: &crate::query::lens_resolver::DefinitionStorage,
 ) -> sea_query::SelectStatement {
-    use crate::query::lens_resolver::ResolvedNode;
-
     let branches = defs
         .iter()
-        .map(|node| {
-            let ResolvedNode::DefinitionRef { def, .. } = node else {
-                unreachable!(
-                    "count_definitions: defs must only contain DefinitionRef"
-                );
-            };
-            crate::query::sql::definition::build_definition_name_sql(src, def)
-        })
+        .map(|node| definition_names_sql(node, storage))
         .collect();
     crate::query::sql::definition::build_definitions_count_sql(branches)
+}
+
+fn definition_names_sql(
+    node: &crate::query::lens_resolver::ResolvedNode,
+    storage: &crate::query::lens_resolver::DefinitionStorage,
+) -> sea_query::SelectStatement {
+    use crate::db::Col;
+    use crate::query::lens_resolver::ResolvedNode;
+    use sea_query::{Expr, UnionType};
+
+    match node {
+        ResolvedNode::DefinitionRef { def, .. } => {
+            crate::query::sql::definition::build_definition_name_sql(
+                def, storage,
+            )
+        }
+        ResolvedNode::Or(nodes) => {
+            let mut iter =
+                nodes.iter().map(|n| definition_names_sql(n, storage));
+            let first = iter.next().expect("pure definition Or is non-empty");
+            iter.fold(first, |mut acc, next| {
+                acc.union(UnionType::Distinct, next);
+                acc
+            })
+        }
+        ResolvedNode::Difference(l, r) => {
+            let mut left = definition_names_sql(l, storage);
+            left.and_where(
+                Expr::col(Col::Name)
+                    .not_in_subquery(definition_names_sql(r, storage)),
+            );
+            left
+        }
+        other => unreachable!(
+            "count_definitions: expected a pure definition node, got {other:?}"
+        ),
+    }
 }
 
 /// 定義枝（単体または Or 経由で到達可能なもの）を fetch 結果に加える統合 SQL。
@@ -167,6 +195,8 @@ pub(crate) fn add_definitions(
     n: usize,
     offset: usize,
     orders: &[crate::query::lens_resolver::ResolvedOrder],
+    storage: &crate::query::lens_resolver::DefinitionStorage,
+    short: bool,
 ) -> anyhow::Result<sea_query::SelectStatement> {
     use crate::query::lens_resolver::ResolvedNode;
 
@@ -179,7 +209,9 @@ pub(crate) fn add_definitions(
             );
         };
         branches.push(
-            crate::query::sql::definition::build_definition_fetch_sql(src, def),
+            crate::query::sql::definition::build_definition_fetch_sql(
+                src, def, storage, short,
+            ),
         );
     }
     branches.extend(rest_fetch);

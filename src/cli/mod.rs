@@ -19,6 +19,7 @@ pub mod args;
 pub mod format;
 pub mod interactive;
 pub mod progress;
+pub mod shell_completion;
 
 #[macro_export]
 macro_rules! safe_println {

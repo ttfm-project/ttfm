@@ -186,6 +186,7 @@ impl Drop for MultiStageProgressView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::IsTerminal;
 
     #[test]
     fn test_multi_stage_progress_view_transitions_and_monotonicity() {
@@ -233,7 +234,11 @@ mod tests {
         assert!(!stderr_view.enabled);
 
         let active_view = MultiStageProgressView::for_stderr(true);
-        assert!(active_view.enabled);
+        if std::io::stderr().is_terminal() {
+            assert!(active_view.enabled);
+        } else {
+            assert!(!active_view.enabled);
+        }
     }
 
     #[test]

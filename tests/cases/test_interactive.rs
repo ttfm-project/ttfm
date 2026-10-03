@@ -242,7 +242,7 @@ fn test_interactive_clear_index_with_prompt() {
     let err_str = String::from_utf8(err_out).unwrap();
     assert!(out_str.contains("Clear indexed files? [y/N]: "));
     assert!(out_str.contains("File indexes cleared successfully."));
-    assert!(err_str.contains("Index not found"));
+    assert!(!err_str.contains("Error"));
 }
 
 #[test]
@@ -415,72 +415,14 @@ fn test_interactive_search_internal_quotes_preserved() {
 }
 
 #[test]
-fn test_interactive_tab_no_matches_transient_hint() {
-    use reedline::ReedlineEvent;
-    use std::sync::{Arc, Mutex};
-    use ttfm::cli::interactive::{
-        autocomplete::{InteractiveCompleter, InteractiveHinter},
-        runner::InteractiveEditMode,
-        state::State,
-    };
+fn test_interactive_completer_no_matches_returns_empty() {
+    use reedline::Completer;
+    use ttfm::cli::interactive::runner::InteractiveCompleter;
 
-    let state = Arc::new(Mutex::new(State::new()));
-    let last_path = Arc::new(Mutex::new(".".to_string()));
-    let current_line = Arc::new(Mutex::new("s nonexistent_query".to_string()));
-    let hinter = Arc::new(Mutex::new(InteractiveHinter::with_current_line(
-        state.clone(),
-        last_path,
-        current_line.clone(),
-    )));
-    let completer =
-        Arc::new(Mutex::new(InteractiveCompleter::new(state.clone())));
-
-    let mut edit_mode = InteractiveEditMode::with_hinter_and_completer(
-        reedline::Emacs::new(
-            ttfm::cli::interactive::runner::build_keybindings(),
-        ),
-        current_line.clone(),
-        state.clone(),
-        hinter.clone(),
-        completer,
-    );
-
-    // Tab キーのイベント (UntilFound([HistoryHintComplete, Menu("completion_menu"), MenuNext]))
-    let tab_event = ReedlineEvent::UntilFound(vec![
-        ReedlineEvent::HistoryHintComplete,
-        ReedlineEvent::Menu("completion_menu".to_string()),
-        ReedlineEvent::MenuNext,
-    ]);
-
-    let event = edit_mode.handle_reedline_event(tab_event);
-
-    // メニューを開かず (ReedlineEvent::Menu ではない)、再描画 (Repaint) を返し、
-    // hinter から減光の " (no matches)" が得られること
-    assert_eq!(event, ReedlineEvent::Repaint);
-    let hint_str = hinter
-        .lock()
-        .unwrap()
-        .handle_line("s nonexistent_query", 19);
-    assert!(
-        hint_str.contains("(no matches)"),
-        "hint should contain (no matches), got: {hint_str:?}"
-    );
-
-    // 矢印キー (Left) を押すと一時メッセージがクリアされ、カーソル移動 (Left) が返ること
-    let left_event = ReedlineEvent::UntilFound(vec![
-        ReedlineEvent::MenuLeft,
-        ReedlineEvent::Left,
-    ]);
-    let left_res = edit_mode.handle_reedline_event(left_event);
-    assert_eq!(left_res, ReedlineEvent::Left);
-    let hint_after_left = hinter
-        .lock()
-        .unwrap()
-        .handle_line("s nonexistent_query", 18);
-    assert!(
-        !hint_after_left.contains("(no matches)"),
-        "hint should be cleared after arrow key, got: {hint_after_left:?}"
-    );
+    let fetcher = Box::new(|_line: &str, _pos: usize| vec![]);
+    let mut completer = InteractiveCompleter::new(fetcher, "");
+    let res = completer.complete("s nonexistent_query", 19);
+    assert!(res.is_empty());
 }
 
 #[test]
@@ -518,8 +460,75 @@ fn test_interactive_help_command() {
     assert!(out_str.contains("Nesting with Aggregation (Combined):"));
     assert!(out_str.contains("path:^/mnt/*/: &: sum(size:)"));
     assert!(out_str.contains("Eval (q()):"));
-    assert!(out_str.contains("> # Show right columns"));
-    assert!(out_str.contains("< # Show left columns"));
+    assert!(out_str.contains("# Show right columns"));
+    assert!(out_str.contains("# Show left columns"));
+}
+
+#[test]
+fn test_quit_to_init_restores_default_query_ghost() {
+    use std::sync::{Arc, Mutex};
+    use ttfm::cli::interactive::autocomplete::{
+        InteractiveHinter, DEFAULT_QUERY,
+    };
+    use ttfm::cli::interactive::command::{dispatch_command, parse_command};
+    use ttfm::cli::interactive::runner::sync_hinter_last_query;
+    use ttfm::cli::interactive::state::State;
+
+    let (store, registry, _dir, _root) = setup_env(&["a.txt"]);
+    let mut state = State::new();
+    state.to_searched("extension:txt".into(), None, 1, None, false);
+    let hinter = Arc::new(Mutex::new(InteractiveHinter::new()));
+    hinter.lock().unwrap().set_last_query("extension:txt");
+
+    let cmd = parse_command("q", true).unwrap();
+    let mut path = ".".to_string();
+    let config = Config::default();
+    let write_opts = WriteOptions::default();
+    let mut input = Cursor::new(Vec::<u8>::new());
+    let mut output = Vec::new();
+    let mut err_out = Vec::new();
+    let cont = dispatch_command(
+        cmd,
+        &mut state,
+        &store,
+        &registry,
+        &config,
+        write_opts,
+        &mut path,
+        &mut input,
+        &mut output,
+        &mut err_out,
+    )
+    .unwrap();
+    assert!(cont);
+    assert!(matches!(state, State::Init));
+    assert_eq!(state.last_query(), None);
+
+    sync_hinter_last_query(&hinter, state.last_query(), DEFAULT_QUERY);
+    assert_eq!(hinter.lock().unwrap().handle_line("s", 1), " *:*");
+
+    state.to_searched("extension:txt".into(), None, 1, None, false);
+    hinter.lock().unwrap().set_last_query("extension:txt");
+    let cmd = parse_command("q", true).unwrap();
+    dispatch_command(
+        cmd,
+        &mut state,
+        &store,
+        &registry,
+        &config,
+        WriteOptions::default(),
+        &mut path,
+        &mut input,
+        &mut output,
+        &mut err_out,
+    )
+    .unwrap();
+    let initial = "filename:a.txt";
+    sync_hinter_last_query(&hinter, state.last_query(), initial);
+    assert_eq!(
+        hinter.lock().unwrap().handle_line("s", 1),
+        " filename:a.txt"
+    );
 }
 
 #[test]

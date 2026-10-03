@@ -133,7 +133,7 @@ fn test_interactive_horizontal_paging_next_and_prev_columns() {
     let mut state = State::new();
     let config = Config::default();
     let write_opts = WriteOptions::default();
-    let last_path = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let mut last_path = String::new();
 
     let cmd_s = parse_command("s extension:txt", false).unwrap();
     let mut out1 = Vec::new();
@@ -145,7 +145,7 @@ fn test_interactive_horizontal_paging_next_and_prev_columns() {
         &registry,
         &config,
         write_opts.clone(),
-        &last_path,
+        &mut last_path,
         &mut std::io::Cursor::new(b""),
         &mut out1,
         &mut err1,
@@ -167,7 +167,7 @@ fn test_interactive_horizontal_paging_next_and_prev_columns() {
         &registry,
         &config,
         write_opts.clone(),
-        &last_path,
+        &mut last_path,
         &mut std::io::Cursor::new(b""),
         &mut out2,
         &mut err2,
@@ -189,7 +189,7 @@ fn test_interactive_horizontal_paging_next_and_prev_columns() {
         &registry,
         &config,
         write_opts,
-        &last_path,
+        &mut last_path,
         &mut std::io::Cursor::new(b""),
         &mut out3,
         &mut err3,

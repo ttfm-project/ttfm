@@ -21,7 +21,7 @@ pub mod eval;
 pub use cache::*;
 pub use eval::*;
 
-use crate::db::{Store, TargetTable};
+use crate::db::Store;
 use crate::response::SearchResponse;
 use crate::tag::TagRegistry;
 use anyhow::Result;
@@ -68,12 +68,6 @@ pub fn search(
     options: SearchOptions,
     sink: &mut dyn crate::query::error::WarningSink,
 ) -> Result<SearchResponse> {
-    if !store.path_for_target(TargetTable::FileReferences).exists() {
-        return Err(anyhow::anyhow!(
-            "Index not found. Please run 'index' command first."
-        ));
-    }
-
     let n = options.n.unwrap_or(0);
     let offset = options.offset.unwrap_or(0);
 
@@ -244,7 +238,7 @@ pub(crate) fn search_core(
     )?
     .with_order(order)
     .with_short(short)
-    .with_store_tags_dir(Some(store.tags_dir()));
+    .with_store(store);
     let fetcher = crate::query::fetcher::Fetcher::new(&resolver, &store.conn);
 
     let mut results = fetcher.fetch(n, offset)?;

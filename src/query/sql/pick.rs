@@ -30,8 +30,8 @@ use crate::db::{
 };
 use crate::query::ast::ComparisonOp;
 use crate::query::lens_resolver::{
-    NvalueRhs, ResolvedAggregationNode, ResolvedCalculationNode, ResolvedNode,
-    ResolvedOperand,
+    DefinitionStorage, NvalueRhs, ResolvedAggregationNode,
+    ResolvedCalculationNode, ResolvedNode, ResolvedOperand,
 };
 use crate::query::lens_schema::{to_bin_op, StorageMapping};
 use crate::types::ItemKind;
@@ -48,6 +48,7 @@ pub trait BuildPick {
 pub struct SimplePickNode<'a> {
     pub src: &'a Src,
     pub node: &'a ResolvedNode,
+    pub storage: &'a DefinitionStorage,
 }
 
 /// 集約コンテキストが必要なクエリ用ノード。
@@ -55,6 +56,7 @@ pub struct AggPickNode<'a> {
     pub src: &'a Src,
     pub node: &'a ResolvedNode,
     pub agg_ctx: AggregationContext,
+    pub storage: &'a DefinitionStorage,
 }
 
 /// 集約コンテキストと Nest コンテキスト両方が必要なクエリ用ノード。
@@ -63,23 +65,30 @@ pub struct NestPickNode<'a> {
     pub node: &'a ResolvedNode,
     pub agg_ctx: AggregationContext,
     pub nest_ctx: NestContext,
+    pub storage: &'a DefinitionStorage,
 }
 
 impl BuildPick for SimplePickNode<'_> {
     fn build_pick(&self) -> SelectStatement {
-        build_pick(self.src, self.node)
+        build_pick(self.src, self.node, self.storage)
     }
 }
 
 impl BuildPick for AggPickNode<'_> {
     fn build_pick(&self) -> SelectStatement {
-        build_pick_agg(self.src, self.node, &self.agg_ctx)
+        build_pick_agg(self.src, self.node, &self.agg_ctx, self.storage)
     }
 }
 
 impl BuildPick for NestPickNode<'_> {
     fn build_pick(&self) -> SelectStatement {
-        build_pick_nest(self.src, self.node, &self.agg_ctx, &self.nest_ctx)
+        build_pick_nest(
+            self.src,
+            self.node,
+            &self.agg_ctx,
+            &self.nest_ctx,
+            self.storage,
+        )
     }
 }
 
@@ -92,21 +101,31 @@ pub enum PickNode<'a> {
 
 impl<'a> PickNode<'a> {
     /// ノードを走査してコンテキストを事前計算し、適切な型で包みます。
-    pub fn new(src: &'a Src, node: &'a ResolvedNode) -> Self {
+    pub fn new(
+        src: &'a Src,
+        node: &'a ResolvedNode,
+        storage: &'a DefinitionStorage,
+    ) -> Self {
         if needs_nest_context(node) {
-            let agg_ctx = build_aggregation_context(src, node);
-            let nest_ctx = build_nest_context(src, node);
+            let agg_ctx = build_aggregation_context(src, node, storage);
+            let nest_ctx = build_nest_context(src, node, storage);
             PickNode::Nest(NestPickNode {
                 src,
                 node,
                 agg_ctx,
                 nest_ctx,
+                storage,
             })
         } else if needs_aggregation_context(node) {
-            let agg_ctx = build_aggregation_context(src, node);
-            PickNode::Aggregation(AggPickNode { src, node, agg_ctx })
+            let agg_ctx = build_aggregation_context(src, node, storage);
+            PickNode::Aggregation(AggPickNode {
+                src,
+                node,
+                agg_ctx,
+                storage,
+            })
         } else {
-            PickNode::Simple(SimplePickNode { src, node })
+            PickNode::Simple(SimplePickNode { src, node, storage })
         }
     }
 
@@ -161,9 +180,13 @@ fn add_type_filters(
 }
 
 /// コンテキストなしで SQL を生成します（集約・Nest ノードを含まないクエリ向け）。
-pub fn build_pick(src: &Src, node: &ResolvedNode) -> SelectStatement {
+pub fn build_pick(
+    src: &Src,
+    node: &ResolvedNode,
+    storage: &DefinitionStorage,
+) -> SelectStatement {
     node.fold(&|node, child_sqls: Vec<SelectStatement>| {
-        match try_dispatch_common(src, node, child_sqls) {
+        match try_dispatch_common(src, node, child_sqls, storage) {
             Ok(sql) => sql,
             Err(_) => unreachable!("build_pick called with aggregation or nest node: use build_pick_agg or build_pick_nest"),
         }
@@ -175,9 +198,10 @@ pub fn build_pick_agg(
     src: &Src,
     node: &ResolvedNode,
     agg_ctx: &AggregationContext,
+    storage: &DefinitionStorage,
 ) -> SelectStatement {
     node.fold(&|node, child_sqls: Vec<SelectStatement>| {
-        match try_dispatch_common(src, node, child_sqls) {
+        match try_dispatch_common(src, node, child_sqls, storage) {
             Ok(sql) => sql,
             Err(_) => match node {
                 ResolvedNode::MergedNestMatch {
@@ -251,9 +275,10 @@ pub fn build_pick_nest(
     node: &ResolvedNode,
     agg_ctx: &AggregationContext,
     nest_ctx: &NestContext,
+    storage: &DefinitionStorage,
 ) -> SelectStatement {
     node.fold(&|node, child_sqls: Vec<SelectStatement>| {
-        match try_dispatch_common(src, node, child_sqls) {
+        match try_dispatch_common(src, node, child_sqls, storage) {
             Ok(sql) => sql,
             Err(_) => match node {
                 ResolvedNode::MergedNestMatch {

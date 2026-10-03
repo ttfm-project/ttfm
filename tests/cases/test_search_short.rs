@@ -23,6 +23,7 @@ use ttfm::indexing::Indexer;
 use ttfm::query::error::Warning;
 use ttfm::search::{search_short, SearchOptions};
 use ttfm::tag::TagRegistry;
+use ttfm::types::Origin;
 
 fn setup_test_index() -> Result<(Store, TagRegistry, tempfile::TempDir)> {
     let dir = tempdir()?;
@@ -126,8 +127,10 @@ fn test_search_short_name_with_fallback() -> Result<()> {
     assert!(names.contains(&"readme.rs".to_string()));
     assert!(names.contains(&"main.rs".to_string()));
 
-    // Verify tags partition for name does not exist without user tags (read-side fallback)
-    assert!(!store.tags_dir().join("type=name").exists());
+    assert!(store
+        .tags_origin_dir(Origin::File)
+        .join("type=name")
+        .exists());
 
     // Add user tag name:custom_doc
     let item_id = resp.results[0].id;
@@ -143,8 +146,10 @@ fn test_search_short_name_with_fallback() -> Result<()> {
         None,
     )?;
 
-    // Now type=name partition exists
-    assert!(store.tags_dir().join("type=name").exists());
+    assert!(store
+        .tags_origin_dir(Origin::File)
+        .join("type=name")
+        .exists());
 
     // Re-query short search with name:
     let resp2 = search_short(&store, &registry, "name:", options, &mut sink)?;
@@ -176,6 +181,9 @@ fn test_search_short_rank_discrete() -> Result<()> {
     assert!(ranks.contains(&"0".to_string()));
 
     // Verify tags partition for rank exists
-    assert!(store.tags_dir().join("type=rank").exists());
+    assert!(store
+        .tags_origin_dir(Origin::File)
+        .join("type=rank")
+        .exists());
     Ok(())
 }

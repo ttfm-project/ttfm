@@ -4,6 +4,7 @@ use crate::types::{BiticalType, ItemId, Origin, SType, TagType, TypedTag};
 use crate::util::{parquet_query, ParquetExt};
 use anyhow::Result;
 use sea_query::{Expr, PostgresQueryBuilder, Query, UnionType};
+use strum::IntoEnumIterator;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum WriteAction {
@@ -46,6 +47,7 @@ pub fn write(
     cast_migration: Option<(TagType, BiticalType)>,
 ) -> Result<WriteResponse> {
     let mut modified_types = extract_action_tag_types(&actions);
+    modified_types.extend(definition_partition_types(store, &actions));
     if let Some((cast_type, _)) = &cast_migration {
         modified_types.insert(cast_type.as_str().to_string());
     }
@@ -541,6 +543,12 @@ mod tests {
         crate::indexing::Indexer::new(&store, &registry)
             .initialize_tables()
             .unwrap();
+        crate::db::tags::generate_tags_hive_partitioned(
+            &store,
+            &store.conn,
+            &registry,
+        )
+        .unwrap();
 
         write(
             &store,
@@ -553,7 +561,8 @@ mod tests {
         )
         .unwrap();
 
-        let part_dir = store.tags_dir().join("type=category");
+        let part_dir =
+            store.tags_origin_dir(Origin::User).join("type=category");
         assert!(part_dir.exists());
         assert!(part_dir.join("data.parquet").exists());
     }
@@ -599,7 +608,10 @@ mod tests {
         }];
 
         write(&store, &registry, actions, None).unwrap();
-        assert!(!store.tags_dir().join("type=mtime").exists());
+        assert!(!store
+            .tags_origin_dir(Origin::File)
+            .join("type=mtime")
+            .exists());
     }
 
     #[test]
@@ -607,7 +619,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         // create a dummy corrupted partition dir
-        let part_dir = store.tags_dir().join("type=broken");
+        let part_dir = store.tags_origin_dir(Origin::User).join("type=broken");
         std::fs::create_dir_all(&part_dir).unwrap();
         assert!(part_dir.exists());
 
@@ -616,7 +628,120 @@ mod tests {
         let reg = crate::tag::TagRegistry::with_standard();
         let res = sync_tags_partitions(&store, &reg, &modified);
         assert!(res.is_err());
-        assert!(!part_dir.exists());
+        assert!(part_dir.exists());
+        assert!(store.tags_dir().exists());
+    }
+
+    #[test]
+    fn test_sync_tags_partitions_keeps_partition_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let part_dir = store.tags_origin_dir(Origin::User).join("type=broken");
+        std::fs::create_dir_all(&part_dir).unwrap();
+        std::fs::write(part_dir.join("data.parquet"), b"keep").unwrap();
+        let tmp_part = store.temp_tags_dir().join("type=broken");
+        std::fs::create_dir_all(&tmp_part).unwrap();
+        std::fs::write(tmp_part.join("data.parquet.tmp"), b"tmp").unwrap();
+        let mut modified = rustc_hash::FxHashSet::default();
+        modified.insert("broken".to_string());
+        let reg = crate::tag::TagRegistry::with_standard();
+        let res = sync_tags_partitions(&store, &reg, &modified);
+        assert!(res.is_err());
+        assert!(part_dir.join("data.parquet").exists());
+        assert!(store.tags_dir().exists());
+        assert!(!tmp_part.exists());
+    }
+
+    #[test]
+    fn test_definition_partition_types_from_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let actions = vec![
+            WriteAction::Add {
+                item: ItemId::Volatile(0),
+                tags: vec![
+                    TagOp::Append(TypedTag::new(SType::ItemKind, "tag")),
+                    TagOp::Append(TypedTag::new(SType::Content, "project:foo")),
+                ],
+            },
+            WriteAction::Add {
+                item: ItemId::Volatile(1),
+                tags: vec![
+                    TagOp::Append(TypedTag::new(SType::ItemKind, "type")),
+                    TagOp::Append(TypedTag::new(SType::Content, "score")),
+                ],
+            },
+        ];
+        let types = definition_partition_types(&store, &actions);
+        assert!(types.contains("project"));
+        assert!(types.contains("type"));
+    }
+
+    fn partition_labels(store: &Store, tag_type: &str) -> Vec<String> {
+        let part = store
+            .tags_origin_dir(Origin::User)
+            .join(format!("type={tag_type}/data.parquet"));
+        if !part.exists() {
+            return Vec::new();
+        }
+        store
+            .conn
+            .prepare(&format!(
+                "SELECT label FROM read_parquet('{}')",
+                part.display().to_string().replace('\'', "''")
+            ))
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_definition_item_write_refreshes_tag_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TagRegistry::with_standard();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        crate::indexing::Indexer::new(&store, &registry)
+            .initialize_tables()
+            .unwrap();
+        crate::db::tags::generate_tags_hive_partitioned(
+            &store,
+            &store.conn,
+            &registry,
+        )
+        .unwrap();
+        let resp = write(
+            &store,
+            &registry,
+            vec![WriteAction::Add {
+                item: ItemId::Volatile(0),
+                tags: vec![
+                    TagOp::Append(TypedTag::new(SType::ItemKind, "tag")),
+                    TagOp::Append(TypedTag::new(
+                        SType::Content,
+                        "project:orphan",
+                    )),
+                ],
+            }],
+            None,
+        )
+        .unwrap();
+        let labels = partition_labels(&store, "project");
+        assert!(labels.contains(&"orphan".to_string()), "{labels:?}");
+        let id = resp.new_item_ids[0];
+        write(
+            &store,
+            &registry,
+            vec![WriteAction::Delete {
+                item: ItemId::Stored(id),
+                tags: vec![DeleteTarget::Type(TagType::Base(SType::ItemId))],
+            }],
+            None,
+        )
+        .unwrap();
+        let labels = partition_labels(&store, "project");
+        assert!(!labels.contains(&"orphan".to_string()), "{labels:?}");
     }
 }
 
@@ -696,6 +821,111 @@ pub(crate) fn collect_types_for_items(
     rows.collect::<duckdb::Result<Vec<_>>>().map_err(Into::into)
 }
 
+fn push_definition_type(
+    out: &mut rustc_hash::FxHashSet<String>,
+    kind: &str,
+    content: &str,
+) {
+    match kind {
+        "tag" => {
+            let Some((ty, label)) = content.split_once(':') else {
+                return;
+            };
+            if !ty.is_empty() && !label.is_empty() {
+                out.insert(ty.to_string());
+            }
+        }
+        "type" if !content.is_empty() => {
+            out.insert("type".to_string());
+        }
+        _ => {}
+    }
+}
+
+fn push_stored_definition(
+    store: &Store,
+    id: i64,
+    out: &mut rustc_hash::FxHashSet<String>,
+) {
+    let path = store.path_for_target(TargetTable::ItemReferences);
+    if !path.exists() {
+        return;
+    }
+    let mut q = Query::select();
+    q.column(Col::ItemKind)
+        .column(Col::Content)
+        .from_subquery(
+            parquet_query(&path.to_string_lossy()),
+            Tbl::ItemReferences,
+        )
+        .and_where(Expr::col(Col::ItemId).eq(id));
+    let sql = q.to_string(PostgresQueryBuilder);
+    let Ok(mut stmt) = store.conn.prepare(&sql) else {
+        return;
+    };
+    let Ok(mut rows) = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    }) else {
+        return;
+    };
+    if let Some(Ok((kind, content))) = rows.next() {
+        push_definition_type(out, &kind, &content);
+    }
+}
+
+fn definition_kind_and_content(
+    tags: &[TagOp],
+) -> (Option<String>, Option<String>) {
+    let mut kind = None;
+    let mut content = None;
+    for op in tags {
+        let tag = match op {
+            TagOp::Append(t) | TagOp::Replace(t) => t,
+        };
+        match tag.tag_type() {
+            TagType::Base(SType::ItemKind) => kind = Some(tag.as_str()),
+            TagType::Base(SType::Content) => content = Some(tag.as_str()),
+            _ => {}
+        }
+    }
+    (kind, content)
+}
+
+fn definition_partition_types(
+    store: &Store,
+    actions: &[WriteAction],
+) -> rustc_hash::FxHashSet<String> {
+    let mut out = rustc_hash::FxHashSet::default();
+    for action in actions {
+        match action {
+            WriteAction::Add { item, tags } => {
+                let (kind, content) = definition_kind_and_content(tags);
+                if let (Some(k), Some(c)) = (kind, content) {
+                    push_definition_type(&mut out, &k, &c);
+                }
+                if let ItemId::Stored(id) = item {
+                    push_stored_definition(store, *id, &mut out);
+                }
+            }
+            WriteAction::Delete { item, tags } => {
+                for target in tags {
+                    let DeleteTarget::Tag(tag) = target else {
+                        continue;
+                    };
+                    if tag.tag_type() != TagType::Base(SType::Content) {
+                        continue;
+                    }
+                    push_definition_type(&mut out, "tag", &tag.as_str());
+                }
+                if let ItemId::Stored(id) = item {
+                    push_stored_definition(store, *id, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn extract_action_tag_types(
     actions: &[WriteAction],
 ) -> rustc_hash::FxHashSet<String> {
@@ -753,24 +983,27 @@ fn sync_tags_partitions(
 ) -> Result<()> {
     let types_vec: Vec<&str> =
         modified_types.iter().map(|s| s.as_str()).collect();
-    if let Err(e) = crate::db::tags::update_tags_partitions(
+    let result = crate::db::tags::update_tags_partitions(
         store,
         &store.conn,
         registry,
         &types_vec,
-    ) {
-        for tag_type in &types_vec {
-            let part_dir = store.tags_dir().join(format!("type={tag_type}"));
-            if part_dir.exists() {
-                if let Err(err) = std::fs::remove_dir_all(&part_dir) {
-                    eprintln!(
-                        "Failed to remove invalid partition directory {}: {err}",
-                        part_dir.display()
-                    );
+    );
+    if result.is_err() {
+        if store.temp_tags_dir().exists() {
+            let _ = std::fs::remove_dir_all(store.temp_tags_dir());
+        }
+        for origin in Origin::iter() {
+            for tag_type in &types_vec {
+                let tmp_file = store
+                    .tags_origin_dir(origin)
+                    .join(format!("type={tag_type}"))
+                    .join("data.parquet.tmp");
+                if tmp_file.exists() {
+                    let _ = std::fs::remove_file(tmp_file);
                 }
             }
         }
-        return Err(e);
     }
-    Ok(())
+    result
 }

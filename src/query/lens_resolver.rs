@@ -47,8 +47,9 @@ use crate::query::sql::definition::ResolvedDefinition;
 use crate::types::{Bitical, ItemKind, Label, Origin, Rank, SType, TagType};
 use anyhow::{bail, Result};
 use duckdb::types::Value;
-use sea_query::{BinOper, Condition, Expr, SimpleExpr};
-use std::path::PathBuf;
+use sea_query::{BinOper, Condition, Expr, SelectStatement, SimpleExpr};
+use std::path::{Path, PathBuf};
+use strum::IntoEnumIterator;
 
 /// 物理マッピングが解決された後のクエリノード。
 #[derive(Debug, Clone, PartialEq)]
@@ -787,12 +788,30 @@ impl ResolvedNode {
         self.get_projection().is_some() || self.has_definition_branch()
     }
 
+    pub fn is_pure_definition(&self) -> bool {
+        match self {
+            ResolvedNode::DefinitionRef { .. } => true,
+            ResolvedNode::Or(nodes) => {
+                !nodes.is_empty()
+                    && nodes.iter().all(|n| n.is_pure_definition())
+            }
+            ResolvedNode::Difference(l, r) => {
+                l.is_pure_definition() && r.is_pure_definition()
+            }
+            _ => false,
+        }
+    }
+
     /// ルートから Or だけを辿って DefinitionRef 枝に到達できるか。
-    fn has_definition_branch(&self) -> bool {
+    /// Difference は両辺が純定義のときだけ定義枝とみなす。
+    pub(crate) fn has_definition_branch(&self) -> bool {
         match self {
             ResolvedNode::DefinitionRef { .. } => true,
             ResolvedNode::Or(nodes) => {
                 nodes.iter().any(|n| n.has_definition_branch())
+            }
+            ResolvedNode::Difference(l, r) => {
+                l.is_pure_definition() && r.is_pure_definition()
             }
             _ => false,
         }
@@ -1163,6 +1182,24 @@ fn get_nest_keys_len(node: &ResolvedNode) -> Option<usize> {
         ResolvedNode::Nest { keys, .. } => Some(keys.len()),
         ResolvedNode::And(nodes) => {
             nodes.iter().find_map(|n| get_nest_keys_len(n))
+        }
+        _ => None,
+    }
+}
+
+fn single_nest_projection(
+    node: &ResolvedNode,
+) -> Option<(TagType, Option<&ResolvedNode>)> {
+    match node {
+        ResolvedNode::Nest {
+            keys,
+            nvalue: None,
+            context,
+        } if keys.len() == 1 => {
+            Some((extract_tag_type_from_operand(&keys[0])?, context.as_deref()))
+        }
+        ResolvedNode::And(nodes) => {
+            nodes.iter().find_map(single_nest_projection)
         }
         _ => None,
     }
@@ -2979,6 +3016,110 @@ pub enum DataSource {
     OneView,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DefinitionStorage {
+    pub item_references: Option<PathBuf>,
+    pub tags_dir: Option<PathBuf>,
+    pub indexed: bool,
+    pub attach_item_tags: bool,
+}
+
+fn oneview_sources_exist(store: &crate::db::Store) -> bool {
+    use crate::db::TargetTable;
+    [
+        TargetTable::BaseTags,
+        TargetTable::TagsByLocation,
+        TargetTable::SystemTags,
+        TargetTable::UserTags,
+        TargetTable::ItemReferences,
+        TargetTable::RemovedFiles,
+    ]
+    .into_iter()
+    .all(|target| store.path_for_target(target).exists())
+}
+
+fn has_parquet_file(dir: &Path) -> bool {
+    dir.read_dir().is_ok_and(|mut entries| {
+        entries.any(|e| {
+            e.is_ok_and(|p| {
+                p.path().extension().is_some_and(|ext| ext == "parquet")
+            })
+        })
+    })
+}
+
+fn has_any_parquet(dir: &Path) -> bool {
+    dir.read_dir().is_ok_and(|entries| {
+        entries.flatten().any(|e| has_parquet_file(&e.path()))
+    })
+}
+
+impl DefinitionStorage {
+    pub fn from_store(store: &crate::db::Store) -> Self {
+        let item_references =
+            Some(store.path_for_target(crate::db::TargetTable::ItemReferences))
+                .filter(|p| p.exists());
+        let tags_dir = Some(store.tags_dir()).filter(|d| d.exists());
+        Self {
+            item_references,
+            tags_dir,
+            indexed: store.is_indexed(),
+            attach_item_tags: oneview_sources_exist(store),
+        }
+    }
+
+    pub fn valid_origins(&self) -> Vec<Origin> {
+        Origin::iter()
+            .filter(|o| *o != Origin::File || self.indexed)
+            .collect()
+    }
+
+    pub fn type_origin_dirs(&self, tag_type: &str) -> Vec<PathBuf> {
+        let Some(dir) = &self.tags_dir else {
+            return Vec::new();
+        };
+        self.valid_origins()
+            .into_iter()
+            .map(|o| {
+                dir.join(format!("origin={}", o.as_str()))
+                    .join(format!("type={tag_type}"))
+            })
+            .filter(|p| has_parquet_file(p))
+            .collect()
+    }
+
+    pub fn tags_query(
+        &self,
+        tag_type: Option<&str>,
+        origins: Option<&[Origin]>,
+    ) -> Option<SelectStatement> {
+        let dir = self.tags_dir.as_ref()?;
+        let readable: Vec<&str> = self
+            .valid_origins()
+            .into_iter()
+            .filter(|o| origins.is_none_or(|os| os.contains(o)))
+            .filter(|o| {
+                let origin_dir = dir.join(format!("origin={}", o.as_str()));
+                if let Some(t) = tag_type {
+                    has_parquet_file(&origin_dir.join(format!("type={t}")))
+                } else {
+                    has_any_parquet(&origin_dir)
+                }
+            })
+            .map(|o| o.as_str())
+            .collect();
+        if readable.is_empty() {
+            return None;
+        }
+        let mut q = crate::util::hive_parquet_query(dir);
+        q.and_where(Expr::col(Col::Origin).is_in(readable));
+        if let Some(t) = tag_type {
+            q.and_where(Expr::col(Col::Type).eq(t));
+        }
+        Some(q)
+    }
+}
+
 // ========== Resolver 構造体 ==========
 
 /// クエリの論理展開と物理解決を統合する構造体
@@ -2989,7 +3130,7 @@ pub struct Resolver {
     /// 解決済みの並び順（with_order で設定。空 = SQL 側の既定の並び）
     resolved_order: Vec<ResolvedOrder>,
     short: bool,
-    pub store_tags_dir: Option<PathBuf>,
+    pub definition_storage: DefinitionStorage,
 }
 
 impl Resolver {
@@ -3018,7 +3159,7 @@ impl Resolver {
             resolved_query: optimized,
             resolved_order: Vec::new(),
             short: false,
-            store_tags_dir: None,
+            definition_storage: DefinitionStorage::default(),
         })
     }
 
@@ -3071,65 +3212,34 @@ impl Resolver {
         self.short
     }
 
+    pub fn with_store(mut self, store: &crate::db::Store) -> Self {
+        self.definition_storage = DefinitionStorage::from_store(store);
+        self
+    }
+
     pub fn with_store_tags_dir(mut self, tags_dir: Option<PathBuf>) -> Self {
-        self.store_tags_dir = tags_dir;
+        self.definition_storage.tags_dir = tags_dir;
+        self.definition_storage.indexed = true;
+        self.definition_storage.attach_item_tags = true;
         self
     }
 
     pub fn get_single_direct_projection(&self) -> Option<String> {
-        let (tag_type, ctx) = match &self.resolved_query {
-            ResolvedNode::Nest {
-                keys,
-                nvalue: None,
-                context,
-            } if keys.len() == 1 => {
-                (extract_tag_type_from_operand(&keys[0])?, context.as_deref())
-            }
-            ResolvedNode::And(nodes) => nodes.iter().find_map(|n| match n {
-                ResolvedNode::Nest {
-                    keys,
-                    nvalue: None,
-                    context,
-                } if keys.len() == 1 => Some((
-                    extract_tag_type_from_operand(&keys[0])?,
-                    context.as_deref(),
-                )),
-                _ => None,
-            })?,
-            _ => return None,
-        };
-
+        let (tag_type, ctx) = single_nest_projection(&self.resolved_query)?;
         let func = self.lens.look_up(&tag_type)?.logical_function.as_ref()?;
         func.query()
             .allows_direct_projection(ctx)
             .then(|| tag_type.as_str().to_string())
     }
 
-    pub fn fallback_tag_type(&self, tag_type: &str) -> Option<String> {
-        let desc = self.lens.look_up(&TagType::from(tag_type))?;
-        let func = desc.logical_function.as_ref()?;
-        for rule in func.query().read().rules() {
-            if let crate::query::lens_reader::ReadRule::Fallback(from_type) =
-                rule
-            {
-                return Some(from_type.to_string());
-            }
-        }
-        None
-    }
-
     pub fn data_source(&self, tag_type: &str) -> DataSource {
-        if self.short {
-            if let Some(tags_dir) = &self.store_tags_dir {
-                if tags_dir.join(format!("type={tag_type}")).exists() {
-                    return DataSource::TagsPartition;
-                }
-                if let Some(fb) = self.fallback_tag_type(tag_type) {
-                    if tags_dir.join(format!("type={fb}")).exists() {
-                        return DataSource::TagsPartition;
-                    }
-                }
-            }
+        if self.short
+            && !self
+                .definition_storage
+                .type_origin_dirs(tag_type)
+                .is_empty()
+        {
+            return DataSource::TagsPartition;
         }
         DataSource::OneView
     }
@@ -3253,7 +3363,9 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let tags_dir = dir.path().join("tags");
-        std::fs::create_dir_all(tags_dir.join("type=extension")).unwrap();
+        let file_ext = tags_dir.join("origin=file/type=extension");
+        std::fs::create_dir_all(&file_ext).unwrap();
+        std::fs::File::create(file_ext.join("data.parquet")).unwrap();
 
         let registry = TagRegistry::with_standard();
         let resolver_short = Resolver::new_nowarn("extension:", &registry)
@@ -3277,6 +3389,37 @@ mod tests {
             resolver_normal.data_source("extension"),
             DataSource::OneView,
         );
+    }
+
+    #[test]
+    fn test_definition_storage_type_origin_dirs_respect_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(dir.path().join("db")).unwrap();
+        let file = store.tags_origin_dir(Origin::File);
+        let user = store.tags_origin_dir(Origin::User);
+        for part in [
+            user.join("type=project"),
+            user.join("type=name"),
+            file.join("type=name"),
+        ] {
+            std::fs::create_dir_all(&part).unwrap();
+            std::fs::File::create(part.join("data.parquet")).unwrap();
+        }
+        let storage = DefinitionStorage::from_store(&store);
+        assert_eq!(storage.type_origin_dirs("name"), [user.join("type=name")]);
+
+        std::fs::File::create(store.complete_path()).unwrap();
+        let storage = DefinitionStorage::from_store(&store);
+        let mut names = storage.type_origin_dirs("name");
+        let mut expected = vec![user.join("type=name"), file.join("type=name")];
+        names.sort();
+        expected.sort();
+        assert_eq!(names, expected);
+        assert_eq!(
+            storage.type_origin_dirs("project"),
+            [user.join("type=project")]
+        );
+        assert!(storage.type_origin_dirs("extension").is_empty());
     }
 
     #[test]
@@ -4909,5 +5052,29 @@ mod tests_walk_fold {
         )
         .unwrap();
         assert_eq!(r2.get_single_direct_projection(), None);
+    }
+
+    #[test]
+    fn test_get_single_direct_projection_same_type_prefix_glob_when_short() {
+        let reg = TagRegistry::with_standard();
+        let r = Resolver::new_nowarn("extension:r* & extension:", &reg)
+            .unwrap()
+            .with_short(true);
+        assert_eq!(r.get_single_direct_projection(), None);
+
+        let r_name = Resolver::new_nowarn("name:a* & name:", &reg)
+            .unwrap()
+            .with_short(true);
+        assert_eq!(r_name.get_single_direct_projection(), None);
+
+        let r_off =
+            Resolver::new_nowarn("extension:r* & extension:", &reg).unwrap();
+        assert_eq!(r_off.get_single_direct_projection(), None);
+
+        let r_mtime =
+            Resolver::new_nowarn("extension: & mtime:>2020-01-01", &reg)
+                .unwrap()
+                .with_short(true);
+        assert_eq!(r_mtime.get_single_direct_projection(), None);
     }
 }

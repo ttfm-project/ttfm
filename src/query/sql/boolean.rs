@@ -24,7 +24,9 @@ use super::{
 };
 use crate::db::{BiticalType, Col, CustomFunc, Pronoun::*, Src};
 use crate::query::ast::ComparisonOp;
-use crate::query::lens_resolver::{LabelSetOpKind, ResolvedNode};
+use crate::query::lens_resolver::{
+    DefinitionStorage, LabelSetOpKind, ResolvedNode,
+};
 use crate::query::lens_schema::to_bin_op;
 use sea_query::{Expr, ExprTrait, Query, SelectStatement, SimpleExpr};
 
@@ -170,8 +172,9 @@ pub(super) fn build_label_set_op_pick_sql(
 pub(super) fn build_boolean_sql(
     src: &Src,
     node: &ResolvedNode,
+    storage: &DefinitionStorage,
 ) -> SelectStatement {
-    let agg_ctx = build_aggregation_context(src, node);
+    let agg_ctx = build_aggregation_context(src, node, storage);
     match node {
         ResolvedNode::AggregationMatch { agg, op, rhs } => {
             let cond = nvalue_rhs_condition(
@@ -202,7 +205,7 @@ pub(super) fn build_boolean_sql(
             )
         }
         ResolvedNode::AggregationTagMatch { .. } => {
-            let pick_sql = PickNode::new(src, node).build_pick();
+            let pick_sql = PickNode::new(src, node, storage).build_pick();
             build_boolean_existence_sql(pick_sql)
         }
         ResolvedNode::ScalarMatch { left, op, right } => {
@@ -213,7 +216,7 @@ pub(super) fn build_boolean_sql(
             )
         }
         _ => {
-            let pick_sql = PickNode::new(src, node).build_pick();
+            let pick_sql = PickNode::new(src, node, storage).build_pick();
             build_boolean_existence_sql(pick_sql)
         }
     }

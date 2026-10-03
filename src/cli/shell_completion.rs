@@ -1,0 +1,561 @@
+// Copyright (C) 2026 The TTFM Project Contributors
+// See the CONTRIBUTORS file at the top-level directory of this distribution
+// for a list of copyright holders.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+use crate::autocomplete::{resolve_ttql_candidates, TtqlRole};
+use crate::db::Store;
+use crate::tag::TagRegistry;
+
+pub const BASH_DEFAULT_WORDBREAKS: &str = " \t\n\"'><=;|&(:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellQuote {
+    None,
+    Single,
+    Double,
+}
+
+pub struct CurrentWord {
+    pub text: String,
+    pub quote: ShellQuote,
+    pub text_before_rl: String,
+    pub rl_text: String,
+}
+
+pub struct ShellLine {
+    pub args: Vec<String>,
+    pub current: CurrentWord,
+}
+
+pub fn lex_shell_line(line: &str, wordbreaks: &str) -> Option<ShellLine> {
+    let mut args = Vec::new();
+    let mut text = String::new();
+    let mut in_word = false;
+    let mut quote = ShellQuote::None;
+    let mut closed_quote = false;
+    let mut rl_raw = 0;
+    let mut rl_deq = 0;
+    let mut chars = line.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match quote {
+            ShellQuote::Single => match c {
+                '\'' => {
+                    quote = ShellQuote::None;
+                    closed_quote = true;
+                }
+                _ => text.push(c),
+            },
+            ShellQuote::Double => match c {
+                '"' => {
+                    quote = ShellQuote::None;
+                    closed_quote = true;
+                }
+                '$' | '`' => return None,
+                '\\' => match chars.peek().map(|&(_, n)| n) {
+                    Some(n @ ('$' | '`' | '"' | '\\')) => {
+                        text.push(n);
+                        chars.next();
+                    }
+                    _ => text.push('\\'),
+                },
+                _ => text.push(c),
+            },
+            ShellQuote::None => {
+                if !in_word && !c.is_whitespace() {
+                    in_word = true;
+                    closed_quote = false;
+                    rl_raw = i;
+                    rl_deq = 0;
+                }
+                match c {
+                    ' ' | '\t' => {
+                        if in_word {
+                            args.push(std::mem::take(&mut text));
+                            in_word = false;
+                        }
+                    }
+                    '\\' => {
+                        let (_, n) = chars.next()?;
+                        text.push(n);
+                    }
+                    '\'' | '"' => {
+                        quote = if c == '\'' {
+                            ShellQuote::Single
+                        } else {
+                            ShellQuote::Double
+                        };
+                        rl_raw = i + 1;
+                        rl_deq = text.len();
+                    }
+                    '$' | '`' | ';' | '&' | '|' | '<' | '>' | '(' | ')'
+                    | '\n' => return None,
+                    c if wordbreaks.contains(c) => {
+                        text.push(c);
+                        rl_raw = i + c.len_utf8();
+                        rl_deq = text.len();
+                    }
+                    _ => text.push(c),
+                }
+            }
+        }
+    }
+    if quote == ShellQuote::None && closed_quote && in_word {
+        return None;
+    }
+    if !in_word && quote == ShellQuote::None {
+        rl_raw = line.len();
+        rl_deq = 0;
+    }
+    Some(ShellLine {
+        args,
+        current: CurrentWord {
+            text_before_rl: text[..rl_deq].to_string(),
+            rl_text: line[rl_raw..].to_string(),
+            text,
+            quote,
+        },
+    })
+}
+
+const UNQUOTED_META: &[char] = &[
+    ' ', '\\', '\'', '"', '`', '$', '&', '|', ';', '(', ')', '<', '>', '*',
+    '?', '[', ']', '#', '~', '!', '{', '}',
+];
+
+pub fn quote_for_shell(text: &str, quote: ShellQuote) -> Option<String> {
+    if text.chars().any(char::is_control) {
+        return None;
+    }
+    let mut out = String::new();
+    for c in text.chars() {
+        match quote {
+            ShellQuote::None => {
+                if UNQUOTED_META.contains(&c) {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            ShellQuote::Single => match c {
+                '\'' => out.push_str(r"'\''"),
+                _ => out.push(c),
+            },
+            ShellQuote::Double => match c {
+                '$' | '`' | '"' | '\\' => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                '!' => out.push_str(r#""'!'""#),
+                _ => out.push(c),
+            },
+        }
+    }
+    Some(out)
+}
+
+const GLOBAL_VALUE_OPTS: &[&str] = &[
+    "--confirm",
+    "--on-conflict",
+    "--on-hardlink",
+    "--skip-scope",
+    "-i",
+];
+
+fn value_options(subcommand: &str) -> Vec<&'static str> {
+    let mut opts = GLOBAL_VALUE_OPTS.to_vec();
+    match subcommand {
+        "search" => opts.extend(["-n", "--n", "--offset", "--cid"]),
+        "untag" => opts.push("--condition"),
+        _ => {}
+    }
+    opts
+}
+
+fn positionals<'a>(
+    args: &'a [String],
+    value_opts: &[&str],
+) -> Option<Vec<&'a str>> {
+    let mut out = Vec::new();
+    let mut expects_value = false;
+    for a in args {
+        if expects_value {
+            expects_value = false;
+        } else if let Some((opt, _)) = a.split_once('=') {
+            if !opt.starts_with('-') {
+                out.push(a.as_str());
+            }
+        } else if value_opts.contains(&a.as_str()) {
+            expects_value = true;
+        } else if !a.starts_with('-') {
+            out.push(a.as_str());
+        }
+    }
+    (!expects_value).then_some(out)
+}
+
+pub fn query_arg_role(args: &[String]) -> Option<TtqlRole> {
+    let top = positionals(args.get(1..)?, GLOBAL_VALUE_OPTS)?;
+    let subcommand = *top.first()?;
+    let sub_pos = args.iter().position(|a| a == subcommand)?;
+    let rest = positionals(&args[sub_pos + 1..], &value_options(subcommand))?;
+    match (subcommand, rest.len()) {
+        ("search" | "tag" | "untag", 0) => Some(TtqlRole::Search),
+        ("tag", 1) => Some(TtqlRole::Edit { is_untag: false }),
+        ("untag", 1) => Some(TtqlRole::Edit { is_untag: true }),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ShellKind {
+    Bash,
+    Zsh,
+}
+
+pub fn shell_candidates(
+    store: &Store,
+    registry: &TagRegistry,
+    line: &str,
+    point: usize,
+    wordbreaks: &str,
+    shell: ShellKind,
+    offset: usize,
+    limit: usize,
+) -> Vec<String> {
+    let point_byte = line
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(line.len()))
+        .nth(point)
+        .unwrap_or_else(|| {
+            if line.is_char_boundary(point) {
+                point
+            } else {
+                line.len()
+            }
+        });
+    let Some(head) = line.get(..point_byte) else {
+        return vec![];
+    };
+    let Some(parsed) = lex_shell_line(head, wordbreaks) else {
+        return vec![];
+    };
+    if parsed.current.text.starts_with('-') {
+        return vec![];
+    }
+    let Some(role) = query_arg_role(&parsed.args) else {
+        return vec![];
+    };
+    let ttql = parsed.current.text.as_str();
+    let mut cand_list =
+        resolve_ttql_candidates(store, registry, ttql, role, offset, limit);
+    if cand_list.is_empty() && offset > 0 {
+        cand_list =
+            resolve_ttql_candidates(store, registry, ttql, role, 0, limit);
+    }
+    let replacements: Vec<String> = cand_list
+        .into_iter()
+        .filter_map(|c| {
+            ttql.get(..c.span.0).map(|head| format!("{head}{}", c.raw))
+        })
+        .collect();
+    match shell {
+        ShellKind::Zsh => replacements
+            .into_iter()
+            .filter(|r| !r.chars().any(char::is_control))
+            .collect(),
+        ShellKind::Bash => bash_replies(&parsed.current, &replacements),
+    }
+}
+
+fn bash_replies(word: &CurrentWord, replacements: &[String]) -> Vec<String> {
+    let replies: Vec<String> = replacements
+        .iter()
+        .filter_map(|r| r.strip_prefix(word.text_before_rl.as_str()))
+        .map(|r| match word.quote {
+            ShellQuote::None => r.strip_suffix(' ').unwrap_or(r),
+            _ => r,
+        })
+        .filter_map(|r| quote_for_shell(r, word.quote))
+        .collect();
+    match (replies.as_slice(), word.quote) {
+        (_, ShellQuote::None) => replies,
+        ([only], _) if *only == word.rl_text => vec![],
+        ([only], _) => vec![only.clone(), format!("{only} ")],
+        _ => replies,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WB_DEFAULT: &str = BASH_DEFAULT_WORDBREAKS;
+
+    #[test]
+    fn test_lex_single_quoted_spans_spaces() {
+        let l = lex_shell_line("ttfm search 'a:x & pro", WB_DEFAULT).unwrap();
+        assert_eq!(l.args, ["ttfm", "search"]);
+        assert_eq!(l.current.text, "a:x & pro");
+        assert_eq!(l.current.quote, ShellQuote::Single);
+        assert_eq!(l.current.text_before_rl, "");
+        assert_eq!(l.current.rl_text, "a:x & pro");
+    }
+
+    #[test]
+    fn test_lex_unquoted_splits_rl_text_at_wordbreak() {
+        let l = lex_shell_line("ttfm search filename:te", WB_DEFAULT).unwrap();
+        assert_eq!(l.current.text, "filename:te");
+        assert_eq!(l.current.quote, ShellQuote::None);
+        assert_eq!(l.current.text_before_rl, "filename:");
+        assert_eq!(l.current.rl_text, "te");
+    }
+
+    #[test]
+    fn test_lex_reopened_single_quote_after_escaped_quote() {
+        let l = lex_shell_line(r"ttfm search 'it'\''s pr", WB_DEFAULT).unwrap();
+        assert_eq!(l.current.text, "it's pr");
+        assert_eq!(l.current.quote, ShellQuote::Single);
+        assert_eq!(l.current.text_before_rl, "it'");
+    }
+
+    #[test]
+    fn test_lex_double_quote_unescapes() {
+        let l = lex_shell_line(r#"ttfm search "a\$b\"c"#, WB_DEFAULT).unwrap();
+        assert_eq!(l.current.text, "a$b\"c");
+        assert_eq!(l.current.quote, ShellQuote::Double);
+    }
+
+    #[test]
+    fn test_lex_rejects_expansions_and_operators() {
+        for line in [
+            "ttfm search a;b",
+            "ttfm search a|b",
+            "ttfm search $(x",
+            "ttfm search `x",
+            "ttfm search \"a$(x",
+            "ttfm search 'a'b",
+        ] {
+            assert!(lex_shell_line(line, WB_DEFAULT).is_none(), "{line}");
+        }
+    }
+
+    #[test]
+    fn test_lex_empty_current_word() {
+        let l = lex_shell_line("ttfm search ", WB_DEFAULT).unwrap();
+        assert_eq!(l.args, ["ttfm", "search"]);
+        assert_eq!(l.current.text, "");
+        assert_eq!(l.current.quote, ShellQuote::None);
+    }
+
+    #[test]
+    fn test_quote_for_shell_by_context() {
+        assert_eq!(
+            quote_for_shell("a b\"$(x)*", ShellQuote::None).unwrap(),
+            r#"a\ b\"\$\(x\)\*"#
+        );
+        assert_eq!(
+            quote_for_shell("it's", ShellQuote::Single).unwrap(),
+            r"it'\''s"
+        );
+        assert_eq!(
+            quote_for_shell("a\"$`\\!", ShellQuote::Double).unwrap(),
+            r#"a\"\$\`\\"'!'""#
+        );
+        assert!(quote_for_shell("a\nb", ShellQuote::Single).is_none());
+        assert!(quote_for_shell("a\tb", ShellQuote::None).is_none());
+    }
+
+    #[test]
+    fn test_query_arg_role_by_positional_index() {
+        let args = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(
+            query_arg_role(&args("ttfm search")),
+            Some(TtqlRole::Search)
+        );
+        assert_eq!(
+            query_arg_role(&args("ttfm -q search -n 5")),
+            Some(TtqlRole::Search)
+        );
+        assert_eq!(query_arg_role(&args("ttfm search q")), None);
+        assert_eq!(
+            query_arg_role(&args("ttfm tag q")),
+            Some(TtqlRole::Edit { is_untag: false })
+        );
+        assert_eq!(
+            query_arg_role(&args("ttfm untag --condition c q")),
+            Some(TtqlRole::Edit { is_untag: true })
+        );
+        assert_eq!(query_arg_role(&args("ttfm index")), None);
+        assert_eq!(query_arg_role(&args("ttfm --confirm")), None);
+        assert_eq!(
+            query_arg_role(&args("ttfm --skip-scope x search")),
+            Some(TtqlRole::Search)
+        );
+        assert_eq!(
+            query_arg_role(&args("ttfm tag --on-conflict skip q")),
+            Some(TtqlRole::Edit { is_untag: false })
+        );
+        assert_eq!(
+            query_arg_role(&args("ttfm tag --on-conflict=skip q")),
+            Some(TtqlRole::Edit { is_untag: false })
+        );
+    }
+
+    fn setup_test_store_with_files(
+        files: &[&str],
+    ) -> (tempfile::TempDir, Store, TagRegistry) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("files");
+        for name in files {
+            let p = root.join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, *name).unwrap();
+        }
+        let reg = TagRegistry::with_standard();
+        let store = Store::open(base.join("db")).unwrap();
+        let indexer = crate::indexing::Indexer::new(&store, &reg);
+        indexer.initialize_tables().unwrap();
+        indexer.run(&[&root], None, false).unwrap();
+        (dir, store, reg)
+    }
+
+    #[test]
+    fn test_shell_candidates_type_and_label_unquoted() {
+        let (_dir, store, reg) = setup_test_store_with_files(&["main.rs"]);
+        let types = shell_candidates(
+            &store,
+            &reg,
+            "ttfm search ext",
+            15,
+            WB_DEFAULT,
+            ShellKind::Bash,
+            0,
+            10,
+        );
+        assert!(types.iter().any(|t| t == "extension:"));
+        let labels = shell_candidates(
+            &store,
+            &reg,
+            "ttfm search extension:r",
+            23,
+            WB_DEFAULT,
+            ShellKind::Bash,
+            0,
+            10,
+        );
+        assert!(labels.iter().any(|l| l == "rs"));
+    }
+
+    #[test]
+    fn test_shell_candidates_inside_aggregate_single_quoted() {
+        let (_dir, store, reg) = setup_test_store_with_files(&["main.rs"]);
+        let line = "ttfm search 'count(";
+        let cli = shell_candidates(
+            &store,
+            &reg,
+            line,
+            line.len(),
+            WB_DEFAULT,
+            ShellKind::Bash,
+            0,
+            50,
+        );
+        assert!(cli.iter().all(|c| c.starts_with("count(")), "{cli:?}");
+        assert!(cli.iter().any(|c| c.ends_with(':')), "{cli:?}");
+        assert!(cli.iter().any(|c| c.ends_with('(')), "{cli:?}");
+        assert!(!cli.iter().any(|c| c == "count(random("), "{cli:?}");
+    }
+
+    #[test]
+    fn test_shell_candidates_single_quoted_unique_is_doubled() {
+        let (_dir, store, reg) = setup_test_store_with_files(&["main.rs"]);
+        let line = "ttfm search 'extension:r";
+        let cli = shell_candidates(
+            &store,
+            &reg,
+            line,
+            line.len(),
+            WB_DEFAULT,
+            ShellKind::Bash,
+            0,
+            10,
+        );
+        assert_eq!(cli, ["extension:rs ", "extension:rs  "]);
+    }
+
+    #[test]
+    fn test_shell_candidates_zsh_returns_dequoted_argument() {
+        let (_dir, store, reg) = setup_test_store_with_files(&["my file.txt"]);
+        let line = "ttfm search 'filename:my";
+        let cli = shell_candidates(
+            &store,
+            &reg,
+            line,
+            line.len(),
+            "",
+            ShellKind::Zsh,
+            0,
+            10,
+        );
+        assert_eq!(cli, ["filename:\"my file.txt\" "]);
+    }
+
+    #[test]
+    fn test_shell_candidates_rejects_non_char_boundary_point() {
+        let (_dir, store, reg) = setup_test_store_with_files(&["main.rs"]);
+        let line = "ttfm search 'extension:あ";
+        assert!(shell_candidates(
+            &store,
+            &reg,
+            line,
+            line.len() - 1,
+            WB_DEFAULT,
+            ShellKind::Bash,
+            0,
+            10,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn test_shell_candidates_cycles_offset_back_to_zero_when_empty() {
+        let (_dir, store, reg) = setup_test_store_with_files(&["main.rs"]);
+        let line = "ttfm search extension:r";
+        let first = shell_candidates(
+            &store,
+            &reg,
+            line,
+            line.len(),
+            WB_DEFAULT,
+            ShellKind::Bash,
+            0,
+            10,
+        );
+        assert!(!first.is_empty());
+        let cycled = shell_candidates(
+            &store,
+            &reg,
+            line,
+            line.len(),
+            WB_DEFAULT,
+            ShellKind::Bash,
+            10,
+            10,
+        );
+        assert_eq!(cycled, first);
+    }
+}

@@ -125,6 +125,9 @@ fn build_count_expr(
     agg_ctx: &AggregationContext,
 ) -> SimpleExpr {
     let key = inner as *const ResolvedNode as usize;
+    if inner.is_pure_definition() {
+        return lookup_definition_count_expr(key, agg_ctx);
+    }
     if let Some((_, rest)) = inner.split_definition_branches() {
         return definition_count_expr(rest.as_ref(), key, agg_ctx);
     }
@@ -588,6 +591,20 @@ pub(super) fn build_count_nvalue_sql(
     agg_ctx: &AggregationContext,
     nest_ctx: Option<&NestContext>,
 ) -> SelectStatement {
+    if inner.is_pure_definition() {
+        let key = inner as *const ResolvedNode as usize;
+        return build_definition_count_nvalue_sql(
+            src,
+            proj_operand,
+            key,
+            None,
+            context,
+            item_scope,
+            include_item_id,
+            agg_ctx,
+            nest_ctx,
+        );
+    }
     if let Some((_, rest)) = inner.split_definition_branches() {
         let key = inner as *const ResolvedNode as usize;
         return build_definition_count_nvalue_sql(
@@ -1143,6 +1160,10 @@ fn build_count_stmt(
     agg_ctx: &AggregationContext,
 ) -> SelectStatement {
     let key = inner as *const ResolvedNode as usize;
+    if inner.is_pure_definition() {
+        let definition_expr = lookup_definition_count_expr(key, agg_ctx);
+        return Query::select().expr_as(definition_expr, Scalar).to_owned();
+    }
     let Some((_, rest)) = inner.split_definition_branches() else {
         return build_count_stmt_inner(src, inner, key, None, agg_ctx);
     };

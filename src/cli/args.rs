@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use crate::cli::shell_completion::ShellKind;
 use crate::config::{
     Config, ConfirmMode, ConflictPolicy, HardlinkPolicy, SkipScope,
 };
@@ -140,6 +141,24 @@ pub enum Commands {
         /// メモの内容
         content: String,
     },
+    /// シェル補完用候補を出力します。
+    Complete {
+        /// 取得開始位置
+        #[arg(long)]
+        offset: Option<usize>,
+        /// カーソル位置（文字単位またはバイト単位）
+        #[arg(long)]
+        point: Option<usize>,
+        /// 単語区切り文字
+        #[arg(long, allow_hyphen_values = true)]
+        wordbreaks: Option<String>,
+        /// 対象シェル
+        #[arg(long, value_enum, default_value = "bash")]
+        shell: ShellKind,
+        /// 補完対象の入力行
+        #[arg(trailing_var_arg = true)]
+        query: Vec<String>,
+    },
 }
 
 pub fn build_write_options(cli: &Cli, config: &Config) -> WriteOptions {
@@ -199,5 +218,52 @@ mod tests {
 
         let cli_with_q = Cli::try_parse_from(["ttfm", "-i", "ext:rs"]).unwrap();
         assert_eq!(cli_with_q.interactive, Some(Some("ext:rs".to_string())));
+    }
+
+    #[test]
+    fn test_cli_parse_complete_command_with_offset() {
+        let parsed = Cli::try_parse_from([
+            "ttfm", "complete", "--offset", "10", "--", "s proj:",
+        ])
+        .unwrap();
+        match parsed.command {
+            Some(Commands::Complete { offset, query, .. }) => {
+                assert_eq!(offset, Some(10));
+                assert_eq!(query, vec!["s proj:"]);
+            }
+            _ => panic!("expected Complete command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_complete_command() {
+        let parsed = Cli::try_parse_from([
+            "ttfm",
+            "complete",
+            "--shell",
+            "zsh",
+            "--point",
+            "3",
+            "--wordbreaks",
+            " :",
+            "--",
+            "ttfm search x",
+        ])
+        .unwrap();
+        match parsed.command {
+            Some(Commands::Complete {
+                point,
+                wordbreaks,
+                shell,
+                query,
+                ..
+            }) => {
+                assert_eq!(point, Some(3));
+                assert_eq!(wordbreaks.as_deref(), Some(" :"));
+                assert_eq!(shell, ShellKind::Zsh);
+                assert_eq!(query, vec!["ttfm search x"]);
+            }
+            _ => panic!("expected Complete command"),
+        }
     }
 }
