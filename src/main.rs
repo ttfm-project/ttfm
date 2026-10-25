@@ -69,27 +69,61 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         query,
     }) = &cli.command
     {
+        let line = query.join(" ");
+        let default_wb = ttfm::cli::shell_completion::BASH_DEFAULT_WORDBREAKS;
+        let wb = wordbreaks.as_deref().unwrap_or(default_wb);
+        let pt = point.unwrap_or(line.len());
+        let off = offset.unwrap_or(0);
+        let lim = ttfm::cli::shell_completion::DEFAULT_SHELL_COMPLETION_LIMIT;
+        let dry_outcome =
+            ttfm::cli::shell_completion::evaluate_shell_completion(
+                None, &line, pt, wb, *shell, off, lim,
+            );
+        match dry_outcome {
+            ttfm::cli::shell_completion::ShellCompletionOutcome::Completed(
+                cands,
+            ) if !cands.is_empty() => {
+                for c in cands {
+                    println!("{c}");
+                }
+                return Ok(());
+            }
+            ttfm::cli::shell_completion::ShellCompletionOutcome::Fallback => {
+                std::process::exit(
+                    ttfm::cli::shell_completion::EXIT_SHELL_FALLBACK,
+                );
+            }
+            _ => {}
+        }
         let home = ttfm::get_ttfm_home()?;
         let db_dir = home.join("db");
         if !db_dir.exists() {
             return Ok(());
         }
-        let registry = TagRegistry::with_standard();
+        let mut registry = TagRegistry::with_standard();
+        let config = Config::load();
+        if config.plugins.enabled {
+            registry
+                .load_from_dir(home.join("plugins"), &config.plugins.status)?;
+            registry.load_builtins(&config.plugins.status)?;
+        }
         let store = open_store_and_initialize(&db_dir, &registry)?;
-        let line = query.join(" ");
-        let default_wb = ttfm::cli::shell_completion::BASH_DEFAULT_WORDBREAKS;
-        let candidates = ttfm::cli::shell_completion::shell_candidates(
-            &store,
-            &registry,
+        let outcome = ttfm::cli::shell_completion::evaluate_shell_completion(
+            Some((&store, &registry)),
             &line,
-            point.unwrap_or(line.len()),
-            wordbreaks.as_deref().unwrap_or(default_wb),
+            pt,
+            wb,
             *shell,
-            offset.unwrap_or(0),
-            10,
+            off,
+            lim,
         );
-        for c in candidates {
-            println!("{c}");
+        if let ttfm::cli::shell_completion::ShellCompletionOutcome::Completed(
+            cands,
+        ) = outcome
+        {
+            for c in cands {
+                println!("{c}");
+            }
         }
         return Ok(());
     }
@@ -275,9 +309,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Commands::Complete { .. } => unreachable!("Handled early"),
             Commands::Completion { .. } => unreachable!("Handled early"),
             Commands::Note { content } => {
-                let id = ttfm::tagging::add_item(
-                    &store, &registry, "note", content,
-                )?;
+                let id = ttfm::edit::create_note(&store, &registry, content)?;
                 safe_println!("Created note (ID: {})", id);
             }
         },

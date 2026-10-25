@@ -17,6 +17,7 @@
 
 use crate::tag::TagRegistry;
 use crate::types::Rank;
+use crate::util::{IdenExt, ParquetExt, SelectExt};
 use sea_query::{CaseStatement, Condition, SimpleExpr};
 
 /// システムにおける標準的なランク（優先度）の定義。
@@ -131,23 +132,29 @@ pub(crate) fn batch_update_rank(
     is_file: bool,
     rank: i64,
 ) -> anyhow::Result<()> {
-    use crate::db::TargetTable;
     let target = if is_file {
-        TargetTable::FileReferences
+        crate::db::TargetTable::FileReferences
     } else {
-        TargetTable::ItemReferences
+        crate::db::TargetTable::ItemReferences
     };
-    let updates: Vec<(i64, crate::types::Bitical)> = ids
-        .iter()
-        .map(|id| (*id, crate::types::Bitical::Integer(rank)))
-        .collect();
-    crate::edit::fs_operate::update_column(
-        store,
-        target,
-        crate::db::Col::Rank,
-        crate::types::BiticalType::Integer,
-        &updates,
-    )
+    let path = store.path_for_target(target);
+    let tmp = crate::db::Tbl::Target;
+    let staging = crate::db::Tbl::Item;
+    let updates: Vec<(i64, i64)> = ids.iter().map(|id| (*id, rank)).collect();
+    crate::edit::sql::rank_staging_query(updates)
+        .create_table_as(&store.conn, staging)?;
+    crate::util::parquet_query(&path.to_string_lossy())
+        .create_table_as(&store.conn, tmp)?;
+    crate::edit::sql::update_table_ranks(&store.conn, tmp, staging)?;
+    sea_query::Query::select()
+        .column(sea_query::Asterisk)
+        .from(tmp)
+        .order_by(crate::db::Col::ItemId, sea_query::Order::Asc)
+        .to_owned()
+        .save_parquet(&store.conn, &path)?;
+    tmp.drop_table(&store.conn)?;
+    staging.drop_table(&store.conn)?;
+    Ok(())
 }
 
 /// 指定されたタグ名に対応するデフォルトランクを取得します。

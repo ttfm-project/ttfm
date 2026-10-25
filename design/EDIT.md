@@ -22,6 +22,7 @@ Tag Edit は、検索クエリにマッチしたアイテム群に対して、�
 ### 1.1 対象アイテムの解決
 - `<SearchQuery>` の解決は検索系の `search()` を再利用する。
   ttfm tagは、クエリ → 結果アイテムの `item_id` リスト → 編集の一括適用、という流れ。
+- tag/untagを行えないタグはスキップ
 
 ### 1.2 EditQuery
 `EditQuery` では、評価結果のラベル群が各対象アイテムへ適用される。以下の機能を持つ
@@ -163,6 +164,10 @@ pub enum QueryType { Tag, Untag }  // EditQuery (Tag) / TagQuery (Untag) の二�
 - `TypedTag` 指定 (`project:X`) の場合: 条件を満たすエントリがなければ `modify` を呼ばない（スキップ）。
 - `Projection` 指定 (`project:`) の場合: 条件を満たす具体ラベルを取得し、per-entry で `modify` を呼ぶ。
 `WriteAction` の生成はあくまで `modify` の責務。
+
+### SearchQuery 
+- 基本的にはSearchと共通
+- untagの場合、クエリの全体がProjection（Nest を含む）や集約ならエラー
 
 ### EditQuery / TagQuery の構文とパース
 EditQuery (`QueryType::Tag`) と TagQuery (`QueryType::Untag`) のテキストは、共通の制限付き TTQL サブセットを使う。
@@ -359,14 +364,15 @@ DB 反映 (§7.5) のみで、衝突・ハードリンク・cross-device を伴�
 1アイテムが複数の実パスを持つ場合、**パスごと**に以下を選択させる。
 - スキップ / 移動する / キャンセル (および「以降全て」)
 
-### 7.4 非対話モード (`-y` / パイプ)
+### 7.4 非対話モード (`-y`)
 - プロンプトを出せないため、既定では**衝突または複数 location (ハードリンク) を検出した時点で
   error 中断**し、何も適用しない (どちらも人の選択を要するため)。ハードリンクで中断する場合、
   エラーメッセージに**当該アイテムの全実パスを列挙**する。
 - 対話で決めるはずの解決は、**関心ごとのポリシーフラグ**で事前宣言すれば -y でも一括適用できる
   (対話の「以降全て」を CLI で先出しするのと同義):
-  - `--on-conflict <abort|skip|serial>` — ターゲット衝突時 (§7.2)。`abort`=中断 (既定) /
-    `skip`=衝突アイテムを飛ばし残りを処理 / `serial`=連番サフィックス付与。
+  - `--on-conflict <abort|skip|serial|first>` — ターゲット衝突時 (§7.2) および Replace 多値競合時 (§8.2)。`abort`=中断 (既定) /
+    `skip`=衝突アイテムを飛ばし残りを処理 / `serial`=連番サフィックス付与 (実ファイル衝突専用、Replace 競合は abort) /
+    `first`=先頭候補を自動採用 (Replace 多値競合専用、実ファイル衝突は安全側既定の abort)。
   - `--on-hardlink <abort|skip|all>` — 複数 location 時 (§7.3)。`abort`=中断 (既定) /
     `skip`=ハードリンクのアイテムを飛ばす / `all`=全リンクを移動。
 - フラグを与えない -y は従来どおり安全側 (abort) のまま。
@@ -393,6 +399,7 @@ DB への反映方法は、編集が**実ファイルを変更するか / DB の
   `write` 関数(第5章) が Lens 経由でDBに適用する。
   タグの付け替え (`ttfm replace`, 第6章) も`Add/Delete`の合成なので、
   個々のコマンドが上記に帰着する。書き換え後`OneView::recreate` を行う。
+- 更新後は、未インデックスのディレクトリへファイルを移動した場合、そのディレクトリ配下もIndexing対称に含める
 
 ## 8. キャプチャと参照
 
@@ -429,7 +436,7 @@ SearchQuery 側のパターンでキャプチャした部分文字列を、EditQ
 ### 8.3 例
 - `ttfm tag filename:*_draft.txt filename:{1}.txt` (各ファイルの `_draft` を剥がしてリネーム)
 - `ttfm tag filename:proj_* project:{1}` (ファイル名の一部を project タグとして付与)
-- `ttfm tag filename:*=* {1}:{2}` (`key=value` 名を型付きタグへパース。`author=tanaka` → `author:tanaka`)
+- `ttfm tag filename:"*=* {1}:{2}"` (`key=value` 名を型付きタグへパース。`author=tanaka` → `author:tanaka`)
 
 ## 9. タグの転写 (`ttfm decal`)
 

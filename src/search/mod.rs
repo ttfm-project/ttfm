@@ -175,7 +175,7 @@ pub(crate) fn apply_post_fetch_formatting(
                 .find(|e| e.typed_tag.tag_type().as_str() == "value")
                 .and_then(|e| match e.typed_tag.value() {
                     Bitical::Integer(i) => Some(i.to_string()),
-                    Bitical::Double(d) => Some((d as i64).to_string()),
+                    Bitical::Double(d) => Some(d.to_string()),
                     _ => None,
                 });
             if let Some(raw) = raw {
@@ -216,6 +216,20 @@ pub(crate) fn apply_post_fetch_formatting(
     }
 }
 
+fn resolve(
+    store: &Store,
+    registry: &TagRegistry,
+    query: &str,
+    sink: &mut dyn crate::query::error::WarningSink,
+) -> Result<crate::query::lens_resolver::Resolver> {
+    let parsed = crate::query::parser::parse(query, sink)?;
+    let expanded = eval::expand_eval(parsed, store, registry, sink)?;
+    Ok(crate::query::lens_resolver::Resolver::from_node(
+        expanded, registry, sink,
+    )?
+    .with_store(store))
+}
+
 /// 検索のコア処理。resolver 生成・fetch・スカラー表示整形・ページングを行う。
 /// キャッシュには一切依存しない。
 pub(crate) fn search_core(
@@ -231,14 +245,9 @@ pub(crate) fn search_core(
     if query.trim().is_empty() {
         return Err(anyhow::anyhow!("Empty search query is not allowed"));
     }
-    let parsed = crate::query::parser::parse(query, sink)?;
-    let expanded = eval::expand_eval(parsed, store, registry, sink)?;
-    let resolver = crate::query::lens_resolver::Resolver::from_node(
-        expanded, registry, sink,
-    )?
-    .with_order(order)
-    .with_short(short)
-    .with_store(store);
+    let resolver = resolve(store, registry, query, sink)?
+        .with_order(order)
+        .with_short(short);
     let fetcher = crate::query::fetcher::Fetcher::new(&resolver, &store.conn);
 
     let mut results = fetcher.fetch(n, offset)?;
@@ -250,6 +259,14 @@ pub(crate) fn search_core(
     }
 
     Ok((results, has_more))
+}
+
+pub fn returns_items(
+    store: &Store,
+    registry: &TagRegistry,
+    query: &str,
+) -> Result<bool> {
+    Ok(resolve(store, registry, query, &mut Vec::new())?.returns_items())
 }
 
 #[cfg(test)]
@@ -268,6 +285,32 @@ mod tests {
         Indexer::new(&store, &registry).initialize_tables()?;
         let cache = CacheManager::new(store.db_dir.join("cache"), 0);
         Ok((store, registry, cache))
+    }
+
+    #[test]
+    fn returns_items_only_for_item_selecting_queries() -> Result<()> {
+        let dir = tempdir()?;
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir(&db_dir)?;
+        let (store, registry, _cache) = setup(&db_dir)?;
+        for q in [
+            "*:*",
+            "extension:rs",
+            "type:*",
+            "parentdir: &: count() :> 1",
+        ] {
+            assert!(returns_items(&store, &registry, q)?, "{q}");
+        }
+        for q in [
+            "extension:",
+            "parentdir: &: count()",
+            "count(filename:)",
+            "count(filename:) > 1",
+            "extension: | parentdir:",
+        ] {
+            assert!(!returns_items(&store, &registry, q)?, "{q}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -429,5 +472,39 @@ mod tests {
         let entries = std::fs::read_dir(cache.cache_dir())?.count();
         assert_eq!(entries, 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_post_fetch_formatting_preserves_double_decimals() {
+        use crate::response::Item;
+        use crate::types::{
+            Bitical, Intrinsic, ItemId, ItemKind, Origin, TagEntry, Tags,
+            TypedTag,
+        };
+        let mut results = vec![Item {
+            id: ItemId::Volatile(0),
+            item_kind: ItemKind::Volatile,
+            representative: vec![].into(),
+            rank: 0,
+            intrinsic: Intrinsic::default(),
+            tags: Tags {
+                entries: vec![TagEntry {
+                    typed_tag: TypedTag::new("value", Bitical::Double(222.5)),
+                    origin: Origin::User,
+                }],
+            },
+            item_count: None,
+        }];
+        let registry = TagRegistry::with_standard();
+        let resolver = crate::query::lens_resolver::Resolver::new_nowarn(
+            "avg(size:)",
+            &registry,
+        )
+        .unwrap();
+        apply_post_fetch_formatting(&mut results, &resolver, &registry, true);
+        assert_eq!(
+            results[0].representative.tags[0].value(),
+            Bitical::String("222.5".into())
+        );
     }
 }

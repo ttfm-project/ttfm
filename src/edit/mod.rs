@@ -13,8 +13,11 @@ pub mod write;
 
 use crate::db::Store;
 use crate::query::error::WarningSink;
+use crate::response::Item;
 use crate::tag::TagRegistry;
-use crate::types::TagType;
+use crate::types::{
+    Bitical, BiticalType, ItemId, ItemKind, Origin, SType, TagType, TypedTag,
+};
 use anyhow::{bail, Result};
 
 pub use crate::config::{
@@ -83,14 +86,11 @@ impl WriteOptions {
     }
 
     pub fn is_interactive(&self) -> bool {
-        use std::io::IsTerminal;
         match self.confirm {
             ConfirmMode::Never => false,
             ConfirmMode::Always => true,
             ConfirmMode::Auto => {
-                self.on_conflict.is_none()
-                    && self.on_hardlink.is_none()
-                    && std::io::stdin().is_terminal()
+                self.on_conflict.is_none() && self.on_hardlink.is_none()
             }
         }
     }
@@ -101,6 +101,7 @@ pub struct EditResponse {
     pub updated: usize,
     pub deleted: usize,
     pub fs_ops: usize,
+    pub new_items: usize,
     pub has_skipped: bool,
 }
 
@@ -112,6 +113,29 @@ fn static_tag_types(parsed: Option<&parse::EditQuery>) -> Vec<TagType> {
         .filter(|n| !n.tag_type.has_braced())
         .map(|n| TagType::from(n.tag_type.value().as_str()))
         .collect()
+}
+
+pub fn create_note(
+    store: &Store,
+    registry: &TagRegistry,
+    content: &str,
+) -> Result<i64> {
+    let resp = write::write_and_refresh(
+        store,
+        registry,
+        vec![write::WriteAction::Add {
+            item: ItemId::Volatile(0),
+            tags: vec![
+                write::TagOp::Append(TypedTag::new(
+                    SType::ItemKind,
+                    ItemKind::Note.as_str(),
+                )),
+                write::TagOp::Append(TypedTag::new(SType::Content, content)),
+            ],
+        }],
+        None,
+    )?;
+    Ok(resp.new_item_ids[0])
 }
 
 pub fn edit(
@@ -167,6 +191,32 @@ pub fn edit_with_io<R: std::io::BufRead, W: std::io::Write>(
     )
 }
 
+fn retain_untaggable(
+    store: &Store,
+    item_edits: Vec<(Item, Option<parse::EditQuery>)>,
+) -> Result<Vec<(Item, Option<parse::EditQuery>)>> {
+    let is_builtin =
+        |item: &Item| Origin::within(item.id.as_i64()) == Origin::Builtin;
+    let builtin_ids: Vec<i64> = item_edits
+        .iter()
+        .filter(|(item, _)| item.id.is_stored() && is_builtin(item))
+        .map(|(item, _)| item.id.as_i64())
+        .collect();
+    let materialized = if builtin_ids.is_empty() {
+        Default::default()
+    } else {
+        write::existing_item_ids(store, &builtin_ids)?
+    };
+    Ok(item_edits
+        .into_iter()
+        .filter(|(item, _)| {
+            item.id.is_stored()
+                && (!is_builtin(item)
+                    || materialized.contains(&item.id.as_i64()))
+        })
+        .collect())
+}
+
 pub fn edit_with_prompt(
     store: &Store,
     registry: &TagRegistry,
@@ -179,6 +229,13 @@ pub fn edit_with_prompt(
     prompt: &mut dyn confirm::ConfirmPrompt,
 ) -> Result<EditResponse> {
     registry.load_type_configs(store)?;
+    if query_type == QueryType::Untag
+        && !crate::search::returns_items(store, registry, search_query)?
+    {
+        bail!(
+            "untag cannot use a Projection, Nest, or aggregation as the SearchQuery: '{search_query}'"
+        );
+    }
     let parsed = edit_query
         .map(|q| parse::parse_edit_query(q, query_type, registry))
         .transpose()?;
@@ -193,6 +250,11 @@ pub fn edit_with_prompt(
         parsed.as_ref(),
         sink,
     )?;
+    let item_edits = if query_type == QueryType::Untag {
+        retain_untaggable(store, item_edits)?
+    } else {
+        item_edits
+    };
     let (mut fs_plan, actions, cast_summary) = plan(
         store,
         registry,
@@ -214,6 +276,7 @@ pub fn edit_with_prompt(
             updated: 0,
             deleted: 0,
             fs_ops: 0,
+            new_items: 0,
             has_skipped: false,
         });
     };
@@ -256,6 +319,7 @@ pub fn edit_with_prompt(
         updated: resp.updated,
         deleted: resp.deleted,
         fs_ops: outcome.count(),
+        new_items: resp.new_item_ids.len(),
         has_skipped,
     })
 }
@@ -312,6 +376,53 @@ fn detect_type_casts(
     Ok(casts)
 }
 
+fn reject_mixed_type_inference(
+    item_edits: &[(Item, Option<parse::EditQuery>)],
+    registry: &TagRegistry,
+) -> Result<()> {
+    use crate::query::format::OperandFormat;
+    use std::collections::HashMap;
+
+    let mut batch_types: HashMap<TagType, BiticalType> = HashMap::new();
+    for (_item, q) in item_edits {
+        let Some(q) = q else { continue };
+        for node in &q.nodes {
+            let tt = TagType::from(node.tag_type.value().as_str());
+            if registry.get(tt.as_str()).is_some() {
+                continue;
+            }
+            if registry
+                .type_config(&tt)
+                .and_then(|c| c.bitical_type)
+                .is_some()
+            {
+                continue;
+            }
+            let Some(leaf) = &node.label else { continue };
+            let inferred = if leaf.quoted {
+                BiticalType::String
+            } else {
+                match Bitical::parse(&leaf.value()) {
+                    Some(Ok(v)) => v.name(),
+                    _ => BiticalType::String,
+                }
+            };
+            if let Some(&first) = batch_types.get(&tt) {
+                if first != inferred {
+                    return Err(crate::tag::type_cannot_assign(
+                        &tt,
+                        first,
+                        &leaf.value(),
+                    ));
+                }
+            } else {
+                batch_types.insert(tt, inferred);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn plan(
     store: &Store,
     registry: &TagRegistry,
@@ -323,6 +434,9 @@ fn plan(
     Vec<write::WriteAction>,
     Option<confirm::CastSummary>,
 )> {
+    if matches!(query_type, QueryType::Tag) {
+        reject_mixed_type_inference(&item_edits, registry)?;
+    }
     let cast_targets = detect_type_casts(&item_edits, registry)?;
     if cast_targets.len() > 1 {
         bail!("multiple type cast is not supported in a single command");

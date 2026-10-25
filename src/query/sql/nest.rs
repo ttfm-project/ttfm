@@ -372,7 +372,8 @@ fn build_merged_nvalue_agg_expr(
 ) -> SimpleExpr {
     nvalue.fold(&|op, child_results: Vec<SimpleExpr>| match op {
         ResolvedOperand::Aggregation(ResolvedAggregationNode::Count(inner)) => {
-            let (inner_tag, inner_filter, _) = inner.extract_agg_parts();
+            let items = inner.without_unregistered_definitions();
+            let (inner_tag, inner_filter, _) = items.extract_agg_parts();
             if let Some(filter_node) = inner_filter {
                 let case_expr: SimpleExpr = if let Some(cond) =
                     resolve_simple_filter_condition(&filter_node, View)
@@ -1704,8 +1705,25 @@ pub(super) fn nest(
 
     let mut q = Query::select();
     q.with_cte(with_clause);
-    // 揮発 id は SQL 側では NULL とし、fetch 後に Rust 側で採番する。
-    q.expr_as(Expr::val(None::<i64>), Col::ItemId);
+    let numeric_user_storage = desc.logical_function.is_none()
+        && matches!(
+            &desc.storage,
+            StorageMapping::Basic { column, .. }
+                if matches!(
+                    *column,
+                    Col::LabelInt | Col::LabelDouble | Col::LabelBool
+                )
+        );
+    let item_id_expr: SimpleExpr = if numeric_user_storage {
+        Expr::cust(format!(
+            "ANY_VALUE({}.{})",
+            Iden::to_string(&TopItems),
+            Iden::to_string(&Col::ItemId)
+        ))
+    } else {
+        Expr::val(None::<i64>).into()
+    };
+    q.expr_as(item_id_expr, Col::ItemId);
     q.expr_as(
         Expr::cust(format!(
             "ANY_VALUE({}.{})",

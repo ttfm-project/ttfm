@@ -231,3 +231,58 @@ fn test_double_colon_suggestion_fix() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_typed_tag_label_op_suggests_projection_intersection() -> Result<()> {
+    let dir = tempdir()?;
+    let db_dir = dir.path().join(".ttfm/db");
+    let registry = ttfm::tag::TagRegistry::with_standard();
+    let store = ttfm::db::Store::open(&db_dir)?;
+    ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
+
+    for (query, suggestion) in [
+        ("extension:rs :> 50KB", "extension:rs & size: :> 50KB"),
+        (
+            "extension:rs :> 2024-01-01",
+            "extension:rs & mtime: :> 2024-01-01",
+        ),
+        ("extension:rs :> 100", "extension:rs & size: :> 100"),
+        ("extension:rs := big.rs", "extension:rs & name: := big.rs"),
+        ("extension:rs := false", "extension:rs & is_dir: := false"),
+        (
+            "extension:rs :> File(1)",
+            "extension:rs & item_id: :> File(1)",
+        ),
+        ("extension:rs :>= 50KB", "extension:rs & size: :>= 50KB"),
+        (
+            "extension:rs :> \"50KB\"",
+            "extension:rs & size: :> \"50KB\"",
+        ),
+    ] {
+        let err_msg =
+            search::search_nowarn(&store, &registry, query, Default::default())
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err_msg.contains(
+                "Label Comparison cannot be applied to TypedTag ('extension:rs')"
+            ),
+            "{query}: {err_msg}"
+        );
+        assert!(
+            err_msg.contains(&format!("Did you mean: '{suggestion}'")),
+            "{query}: {err_msg}"
+        );
+        assert!(
+            search::search_nowarn(
+                &store,
+                &registry,
+                suggestion,
+                Default::default()
+            )
+            .is_ok(),
+            "{suggestion}"
+        );
+    }
+    Ok(())
+}

@@ -534,16 +534,34 @@ impl<'a, R: BufRead, W: Write> ConfirmPrompt for IoConfirmPrompt<'a, R, W> {
                 c.as_str()
             )?;
         }
-        write!(self.output, "Choice [1-{}]: ", len * 2)?;
-        self.output.flush()?;
-        let mut buf = String::new();
-        self.input.read_line(&mut buf)?;
-        let idx: usize = buf.trim().parse().unwrap_or(1);
-        let idx_0 = idx.saturating_sub(1);
-        let for_all = idx_0 >= len;
-        let cand_idx = if for_all { idx_0 - len } else { idx_0 };
-        let label = candidates.get(cand_idx).unwrap_or(&candidates[0]).clone();
-        Ok(ReplaceChoice { label, for_all })
+        let total = len * 2;
+        loop {
+            write!(self.output, "Choice [1-{}]: ", total)?;
+            self.output.flush()?;
+            let mut buf = String::new();
+            let bytes = self.input.read_line(&mut buf)?;
+            if bytes == 0 {
+                bail!("input stream closed while reading choice");
+            }
+            let trimmed = buf.trim();
+            if let Ok(idx) = trimmed.parse::<usize>() {
+                if idx >= 1 && idx <= total {
+                    let idx_0 = idx - 1;
+                    let for_all = idx_0 >= len;
+                    let cand_idx = if for_all { idx_0 - len } else { idx_0 };
+                    let label = candidates
+                        .get(cand_idx)
+                        .unwrap_or(&candidates[0])
+                        .clone();
+                    return Ok(ReplaceChoice { label, for_all });
+                }
+            }
+            writeln!(
+                self.output,
+                "Invalid choice: '{}'. Please enter a number between 1 and {}.",
+                trimmed, total
+            )?;
+        }
     }
 
     fn ask_conflict_resolution(
@@ -705,6 +723,43 @@ pub fn confirm_with_io<R: BufRead, W: Write>(
     )
 }
 
+fn count_tag_modifications(
+    actions: &[WriteAction],
+    item_edits: &[(Item, Option<EditQuery>)],
+) -> usize {
+    let replaced: HashSet<(ItemId, TagType)> = actions
+        .iter()
+        .flat_map(|a| match a {
+            WriteAction::Add { item, tags } => tags
+                .iter()
+                .filter_map(|op| match op {
+                    TagOp::Replace(t) => Some((*item, t.tag_type())),
+                    TagOp::Append(_) => None,
+                })
+                .collect(),
+            WriteAction::Delete { .. } => Vec::new(),
+        })
+        .collect();
+    let stored = actions
+        .iter()
+        .filter(|a| match a {
+            WriteAction::Add { item, .. }
+            | WriteAction::Delete { item, .. } => item.is_stored(),
+        })
+        .filter(|a| {
+            !matches!(a, WriteAction::Delete { item, tags }
+                if tags.iter().all(|t| matches!(t, DeleteTarget::Type(tt)
+                    if replaced.contains(&(*item, tt.clone())))))
+        })
+        .count();
+    let unmaterialized: usize = item_edits
+        .iter()
+        .filter(|(item, _)| !item.id.is_stored())
+        .map(|(_, q)| q.as_ref().map_or(0, |q| q.nodes.len()))
+        .sum();
+    stored + unmaterialized
+}
+
 pub fn confirm_with_prompt(
     mut fs_plan: FsPlan,
     actions: Vec<WriteAction>,
@@ -772,7 +827,7 @@ pub fn confirm_with_prompt(
         let summary = ConfirmSummary {
             matched_items: item_edits.len(),
             fs_ops: fs_plan.moves.len() + fs_plan.attrs.len(),
-            tag_ops: actions.len(),
+            tag_ops: count_tag_modifications(&actions, item_edits),
             deleted_items,
             is_registration: item_edits.iter().all(|(_, q)| q.is_none()),
             skipped_types: Vec::new(),
@@ -791,6 +846,72 @@ mod tests {
     use super::*;
     use crate::config::ConfirmMode;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_count_tag_modifications_counts_labels_of_unmaterialized_item() {
+        use crate::edit::QueryType;
+        use crate::types::{Intrinsic, ItemKind, Rank, Tags};
+        let registry = crate::tag::TagRegistry::with_standard();
+        let item = Item {
+            id: ItemId::Volatile(0),
+            item_kind: ItemKind::Tag,
+            representative: vec![].into(),
+            rank: Rank::default(),
+            intrinsic: Intrinsic::default(),
+            tags: Tags::new(),
+            item_count: None,
+        };
+        let query = crate::edit::parse::parse_edit_query(
+            "rank:100 memo:x",
+            QueryType::Tag,
+            &registry,
+        )
+        .unwrap();
+        let folded = vec![WriteAction::Add {
+            item: ItemId::Volatile(0),
+            tags: vec![
+                TagOp::Append(TypedTag::new("name", "project:ttfm")),
+                TagOp::Append(TypedTag::new("rank", "100")),
+                TagOp::Append(TypedTag::new("memo", "x")),
+            ],
+        }];
+        assert_eq!(count_tag_modifications(&folded, &[(item, Some(query))]), 2);
+    }
+
+    #[test]
+    fn test_count_tag_modifications_excludes_replace_companion_delete() {
+        let replace = |id: i64, label: &str| {
+            vec![
+                WriteAction::Delete {
+                    item: ItemId::Stored(id),
+                    tags: vec![DeleteTarget::Type(TagType::from("status"))],
+                },
+                WriteAction::Add {
+                    item: ItemId::Stored(id),
+                    tags: vec![TagOp::Replace(TypedTag::new("status", label))],
+                },
+            ]
+        };
+        let mut actions = replace(1, "done");
+        actions.extend(replace(2, "done"));
+        assert_eq!(count_tag_modifications(&actions, &[]), 2);
+
+        let mut conflict = replace(1, "ttfm");
+        conflict.insert(
+            0,
+            WriteAction::Delete {
+                item: ItemId::Stored(1),
+                tags: vec![DeleteTarget::Type(TagType::from("status"))],
+            },
+        );
+        assert_eq!(count_tag_modifications(&conflict, &[]), 1);
+
+        let untag = vec![WriteAction::Delete {
+            item: ItemId::Stored(1),
+            tags: vec![DeleteTarget::Type(TagType::from("project"))],
+        }];
+        assert_eq!(count_tag_modifications(&untag, &[]), 1);
+    }
 
     #[test]
     fn test_next_serial_path() {
@@ -1130,5 +1251,47 @@ mod tests {
                 .unwrap();
         assert!(res.is_some());
         assert_eq!(prompt.mkdir_count, 1);
+    }
+
+    #[test]
+    fn test_ask_replace_resolution_reprompts_on_invalid_input() {
+        use std::io::Cursor;
+        let mut input = Cursor::new(b"zz\n0\n9\n2\n");
+        let mut output = Vec::new();
+        let mut prompter = IoConfirmPrompt {
+            input: &mut input,
+            output: &mut output,
+        };
+        let candidates = vec![Label::from("a"), Label::from("b")];
+        let res = prompter
+            .ask_replace_resolution(
+                &ItemId::Stored(1),
+                &TagType::from("status"),
+                &candidates,
+            )
+            .unwrap();
+        assert_eq!(res.label, Label::from("b"));
+        assert!(!res.for_all);
+        let out_str = String::from_utf8(output).unwrap();
+        assert!(out_str.contains("Invalid choice"));
+    }
+
+    #[test]
+    fn test_ask_replace_resolution_fails_on_eof() {
+        use std::io::Cursor;
+        let mut input = Cursor::new(b"");
+        let mut output = Vec::new();
+        let mut prompter = IoConfirmPrompt {
+            input: &mut input,
+            output: &mut output,
+        };
+        let candidates = vec![Label::from("a")];
+        assert!(prompter
+            .ask_replace_resolution(
+                &ItemId::Stored(1),
+                &TagType::from("status"),
+                &candidates,
+            )
+            .is_err());
     }
 }

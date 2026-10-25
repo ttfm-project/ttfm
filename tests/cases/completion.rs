@@ -15,7 +15,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use tempfile::TempDir;
 use ttfm::{db::Store, indexing::Indexer, tag::TagRegistry};
 
@@ -198,7 +199,13 @@ fn test_edit_query_completion_offers_allowed_types() {
     let suggestions = completer.complete("t \"filename:test.txt\" ", 22);
     assert!(!suggestions.is_empty());
     assert!(suggestions.iter().any(|s| s.value == "project:"));
-    assert!(!suggestions.iter().any(|s| s.value == "filename:"));
+    assert!(suggestions.iter().any(|s| s.value == "filename:"));
+    assert!(suggestions.iter().any(|s| s.value == "path:"));
+    assert!(suggestions.iter().any(|s| s.value == "mtime:"));
+    assert!(!suggestions.iter().any(|s| s.value == "size:"));
+    assert!(!suggestions.iter().any(|s| s.value == "item_id:"));
+    assert!(!suggestions.iter().any(|s| s.value == "item_kind:"));
+    assert!(!suggestions.iter().any(|s| s.value == "content:"));
 }
 
 #[test]
@@ -816,7 +823,8 @@ fn test_interactive_completer_past_query_on_t_and_u() {
         Box::new(|| "extension:rs".to_string()),
         Box::new(|| ".".to_string()),
         Arc::clone(&hinter),
-    );
+    )
+    .with_untag_query_provider(Box::new(|| Some("extension:rs".to_string())));
 
     let suggestions_t = completer.complete("t", 1);
     assert_eq!(suggestions_t.len(), 1);
@@ -825,6 +833,26 @@ fn test_interactive_completer_past_query_on_t_and_u() {
     let suggestions_u = completer.complete("u", 1);
     assert_eq!(suggestions_u.len(), 1);
     assert_eq!(suggestions_u[0].value, " \"extension:rs\" ");
+}
+
+#[test]
+fn test_interactive_completer_untag_without_provider_offers_no_query() {
+    use reedline::Completer;
+    use std::sync::{Arc, Mutex};
+    use ttfm::cli::interactive::autocomplete::InteractiveHinter;
+    use ttfm::cli::interactive::runner::InteractiveCompleter;
+
+    let fetcher = Box::new(|_line: &str, _pos: usize| vec![]);
+    let hinter = Arc::new(Mutex::new(InteractiveHinter::new()));
+    let mut completer = InteractiveCompleter::with_paths(
+        fetcher,
+        Box::new(|| "extension:rs".to_string()),
+        Box::new(|| ".".to_string()),
+        Arc::clone(&hinter),
+    );
+
+    assert!(completer.complete("u", 1).is_empty());
+    assert_eq!(completer.complete("t", 1)[0].value, " \"extension:rs\" ");
 }
 
 #[test]
@@ -1743,7 +1771,7 @@ _ttfm_completion
     let bytes = std::fs::read(stub.args_file()).unwrap();
     let calls = split_nul(&bytes);
     assert!(calls[0].contains("--offset 0"));
-    assert!(calls[1].contains("--offset 10"));
+    assert!(calls[1].contains("--offset 40"));
     assert!(calls[2].contains("--offset 0"));
 }
 
@@ -1767,7 +1795,7 @@ _ttfm_completion
     let calls = split_nul(&bytes);
     assert!(calls[0].contains("--offset 0"));
     assert!(calls[1].contains("--offset 0"));
-    assert!(calls[2].contains("--offset 10"));
+    assert!(calls[2].contains("--offset 40"));
 }
 
 struct Replay {
@@ -2050,4 +2078,338 @@ fn test_bash_completion_tag_edit_argument() {
         Some('\''),
     );
     assert_eq!(r.argv, ["ttfm", "tag", "filename:baz.txt", "project:"]);
+}
+
+#[test]
+fn test_cli_complete_subcommands_without_existing_db() -> anyhow::Result<()> {
+    let ttfm_bin = env!("CARGO_BIN_EXE_ttfm");
+    let dir = tempfile::tempdir()?;
+    let empty_home = dir.path().join("uninitialized_home");
+    std::fs::create_dir_all(&empty_home)?;
+
+    for (line, expected) in [
+        ("ttfm se", vec!["search"]),
+        ("ttfm -y ta", vec!["tag"]),
+        ("ttfm --interactive se", vec!["search"]),
+        ("ttfm ", vec!["index", "search", "clear", "tag", "untag"]),
+    ] {
+        let out = Command::new(ttfm_bin)
+            .env("TTFM_HOME", &empty_home)
+            .args([
+                "complete",
+                "--shell",
+                "bash",
+                "--point",
+                &line.len().to_string(),
+                "--",
+                line,
+            ])
+            .output()?;
+        assert!(out.status.success(), "failed for line {line}: {out:?}");
+        let stdout = String::from_utf8(out.stdout)?;
+        for exp in expected {
+            assert!(stdout.lines().any(|l| l == exp), "{line}: {stdout:?}");
+        }
+    }
+    assert!(!empty_home.join("db").exists());
+    Ok(())
+}
+
+#[test]
+fn test_bash_completion_fallback_only_on_non_ttql_context() {
+    let (dir, home) = setup_shell_fixture();
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_ttfm")).parent().unwrap();
+    let script =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/completion/ttfm.bash");
+    let out = Command::new("bash")
+        .current_dir(dir.path())
+        .env("PATH", prepend_path(bin_dir))
+        .env("TTFM_HOME", &home)
+        .args([
+            "-c",
+            &format!(
+                r#"
+source "{script}"
+compopt() {{ printf 'compopt:%s\n' "$*"; }}
+COMP_LINE="ttfm index d"
+COMP_POINT=${{#COMP_LINE}}
+COMP_WORDBREAKS=$' \t\n"'\''><=;|&(:'
+_ttfm_completion
+COMP_LINE="ttfm search filename:zz_nonexistent"
+COMP_POINT=${{#COMP_LINE}}
+_ttfm_completion
+COMP_LINE="ttfm search ext"
+COMP_POINT=${{#COMP_LINE}}
+_ttfm_completion
+"#
+            ),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "compopt:-o default -o bashdefault",
+            "compopt:+o default +o bashdefault",
+            "compopt:+o default +o bashdefault",
+        ]
+    );
+}
+
+#[test]
+fn test_bash_completion_requote_preserves_typed_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let files = dir.path().join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    for name in ["aug.o", "author=tanaka.txt"] {
+        std::fs::write(files.join(name), "x").unwrap();
+    }
+    run_ttfm(&home, &["index", files.to_str().unwrap()]);
+
+    let dbl = "ttfm search \"filename:au";
+    let r_dbl = bash_complete_and_replay(
+        &home,
+        dir.path(),
+        dbl,
+        WB_DEFAULT,
+        dbl.find('"').unwrap() + 1,
+        Some('"'),
+    );
+    assert_eq!(r_dbl.replies.len(), 2);
+    assert_eq!(r_dbl.argv, ["ttfm", "search", "filename:\"au"]);
+
+    let sgl = "ttfm search 'filename:au";
+    let r_sgl = bash_complete_and_replay(
+        &home,
+        dir.path(),
+        sgl,
+        WB_DEFAULT,
+        sgl.find('\'').unwrap() + 1,
+        Some('\''),
+    );
+    assert_eq!(r_sgl.replies.len(), 2);
+    assert_eq!(r_sgl.argv, ["ttfm", "search", "filename:\"au"]);
+
+    let unq = "ttfm search filename:au";
+    let r_unq = bash_complete_and_replay(
+        &home,
+        dir.path(),
+        unq,
+        WB_DEFAULT,
+        unq.find(':').unwrap() + 1,
+        None,
+    );
+    assert_eq!(r_unq.replies.len(), 2);
+    assert_eq!(r_unq.argv, ["ttfm", "search", "filename:\"au"]);
+}
+
+#[test]
+fn test_completion_after_nest_operators_offers_types() {
+    let (store, registry, _dir, _root) = setup_completion_env(&["main.rs"]);
+    let reg = registry.clone();
+    let st = store.try_clone().unwrap();
+    let fetcher = Box::new(move |line: &str, pos: usize| {
+        ttfm::autocomplete::fetch_candidates(&st, &reg, line, pos, 0, 100)
+    });
+    let mut completer = InteractiveCompleter::new(fetcher, "");
+
+    for line in [
+        "s extension:rs &: si",
+        "s extension:rs -: si",
+        "t \"extension:rs &: si",
+        "t \"extension:rs -: si",
+    ] {
+        let suggestions = completer.complete(line, line.len());
+        assert!(
+            suggestions.iter().any(|s| s.value == "size:"),
+            "failed for line: {line}"
+        );
+    }
+}
+
+#[test]
+fn test_interactive_index_relative_path_completion() {
+    let (store, registry, _dir, _root) = setup_completion_env(&["main.rs"]);
+    let cands = ttfm::autocomplete::fetch_candidates(
+        &store, &registry, "i sr", 4, 0, 50,
+    );
+    assert!(cands.iter().any(|c| c.raw == "src/"));
+}
+
+#[test]
+fn test_edit_query_tag_relocate_suppresses_labels_while_untag_allows() {
+    let (store, registry, _dir, _root) = setup_completion_env(&["notes.md"]);
+    let reg = registry.clone();
+    let st = store.try_clone().unwrap();
+    let fetcher = Box::new(move |line: &str, pos: usize| {
+        ttfm::autocomplete::fetch_candidates(&st, &reg, line, pos, 0, 100)
+    });
+    let mut completer = InteractiveCompleter::new(fetcher, "");
+
+    let tag_fn = "t \"filename:notes.md\" \"filename:";
+    assert!(completer.complete(tag_fn, tag_fn.len()).is_empty());
+
+    let tag_path = "t \"filename:notes.md\" \"path:";
+    assert!(completer.complete(tag_path, tag_path.len()).is_empty());
+
+    let tag_mtime = "t \"filename:notes.md\" \"mtime:";
+    assert!(!completer.complete(tag_mtime, tag_mtime.len()).is_empty());
+
+    let untag_path = "u \"filename:notes.md\" \"path:";
+    let untag_res = completer.complete(untag_path, untag_path.len());
+    assert!(untag_res.iter().any(|s| s.value.contains("notes.md")));
+}
+
+#[test]
+fn test_cli_complete_loads_plugin_types_in_search_and_edit(
+) -> anyhow::Result<()> {
+    let ttfm_bin = env!("CARGO_BIN_EXE_ttfm");
+    let dir = tempfile::tempdir()?;
+    let ttfm_home = dir.path().join("ttfm_home");
+    std::fs::create_dir_all(&ttfm_home)?;
+    let files_dir = dir.path().join("files");
+    std::fs::create_dir_all(&files_dir)?;
+    std::fs::write(files_dir.join("main.rs"), "fn main() {}")?;
+
+    let status = std::process::Command::new(ttfm_bin)
+        .env("TTFM_HOME", &ttfm_home)
+        .args(["index", files_dir.to_str().unwrap()])
+        .status()?;
+    assert!(status.success());
+
+    let line_search = "ttfm search mime";
+    let out_search = std::process::Command::new(ttfm_bin)
+        .env("TTFM_HOME", &ttfm_home)
+        .args([
+            "complete",
+            "--shell",
+            "bash",
+            "--offset",
+            "12",
+            "--point",
+            &line_search.len().to_string(),
+            "--",
+            line_search,
+        ])
+        .output()?;
+    let search_str = String::from_utf8(out_search.stdout)?;
+    assert!(search_str.lines().any(|l| l == "mimetype:"));
+
+    let line_edit = "ttfm tag filename:main.rs mime";
+    let out_edit = std::process::Command::new(ttfm_bin)
+        .env("TTFM_HOME", &ttfm_home)
+        .args([
+            "complete",
+            "--shell",
+            "bash",
+            "--offset",
+            "26",
+            "--point",
+            &line_edit.len().to_string(),
+            "--",
+            line_edit,
+        ])
+        .output()?;
+    let edit_str = String::from_utf8(out_edit.stdout)?;
+    assert!(!edit_str.lines().any(|l| l == "mimetype:"));
+    Ok(())
+}
+
+#[test]
+fn test_interactive_label_partial_match_and_cli_prefix_match() {
+    let (store, registry, _dir, _root) =
+        setup_completion_env(&["sub/deep_notes.md"]);
+    let line = "s path:deep_notes";
+    let interactive = ttfm::autocomplete::fetch_candidates(
+        &store,
+        &registry,
+        line,
+        line.len(),
+        0,
+        50,
+    );
+    assert!(interactive.iter().any(|c| c.raw.contains("deep_notes.md")));
+
+    let cli = ttfm::autocomplete::resolve_ttql_candidates(
+        &store,
+        &registry,
+        "path:deep_notes",
+        ttfm::autocomplete::TtqlRole::Search,
+        0,
+        50,
+    );
+    assert!(cli.is_empty());
+}
+
+#[test]
+fn test_paging_menu_quick_completes_prefix_and_keeps_substring_menu() {
+    use reedline::{Menu, MenuBuilder, MenuEvent, UndoBehavior};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use ttfm::autocomplete::{Candidate, CandidateKind};
+    use ttfm::cli::interactive::runner::{
+        InteractiveCompleter, PagingColumnarMenu,
+    };
+
+    let fetcher = Box::new(|line: &str, pos: usize| {
+        if line == "s si" {
+            vec![Candidate {
+                raw: "size:".into(),
+                kind: CandidateKind::Type,
+                span: (2, pos),
+            }]
+        } else if line == "s path:sub" {
+            vec![Candidate {
+                raw: "/root/sub/file.rs ".into(),
+                kind: CandidateKind::Label,
+                span: (7, pos),
+            }]
+        } else {
+            vec![]
+        }
+    });
+    let mut completer = InteractiveCompleter::new(fetcher, "");
+    let mut paging_menu = PagingColumnarMenu::new(
+        reedline::ColumnarMenu::default().with_name("completion_menu"),
+        Arc::new(AtomicUsize::new(0)),
+        10,
+    );
+    let mut editor = reedline::Editor::default();
+
+    editor.edit_buffer(
+        |b| {
+            b.set_buffer("s si".to_string());
+            b.set_insertion_point(4);
+        },
+        UndoBehavior::CreateUndoPoint,
+    );
+    paging_menu.menu_event(MenuEvent::Activate(true));
+    assert!(!paging_menu.can_quick_complete());
+    assert!(paging_menu.can_partially_complete(
+        true,
+        &mut editor,
+        &mut completer
+    ));
+    assert_eq!(editor.get_buffer(), "s size:");
+    assert!(!paging_menu.is_active());
+
+    editor.edit_buffer(
+        |b| {
+            b.set_buffer("s path:sub".to_string());
+            b.set_insertion_point(10);
+        },
+        UndoBehavior::CreateUndoPoint,
+    );
+    paging_menu.menu_event(MenuEvent::Activate(true));
+    assert!(!paging_menu.can_partially_complete(
+        true,
+        &mut editor,
+        &mut completer
+    ));
+    assert_eq!(editor.get_buffer(), "s path:sub");
+    assert!(paging_menu.is_active());
+    assert_eq!(paging_menu.get_values().len(), 1);
 }

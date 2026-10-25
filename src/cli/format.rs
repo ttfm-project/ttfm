@@ -591,7 +591,11 @@ pub fn print_simple_results_to_writer(
 
 pub fn format_tag_result(resp: &EditResponse) -> String {
     let mut msg =
-        format!("Updated tags: {}, files: {}.", resp.updated, resp.fs_ops);
+        format!("Updated tags: {}, files: {}", resp.updated, resp.fs_ops);
+    if resp.new_items > 0 {
+        msg.push_str(&format!(", Add Items: {}", resp.new_items));
+    }
+    msg.push('.');
     if resp.has_skipped {
         msg.push_str(" (Some items skipped)");
     }
@@ -875,6 +879,7 @@ mod tests {
             updated: 1,
             deleted: 0,
             fs_ops: 2,
+            new_items: 0,
             has_skipped: false,
         };
         assert_eq!(format_tag_result(&resp), "Updated tags: 1, files: 2.");
@@ -883,9 +888,22 @@ mod tests {
             updated: 0,
             deleted: 0,
             fs_ops: 1,
+            new_items: 0,
             has_skipped: false,
         };
         assert_eq!(format_tag_result(&resp_zero), "Updated tags: 0, files: 1.");
+
+        let resp_new = EditResponse {
+            updated: 5,
+            deleted: 0,
+            fs_ops: 0,
+            new_items: 1,
+            has_skipped: false,
+        };
+        assert_eq!(
+            format_tag_result(&resp_new),
+            "Updated tags: 5, files: 0, Add Items: 1."
+        );
     }
 
     #[test]
@@ -894,6 +912,7 @@ mod tests {
             updated: 0,
             deleted: 3,
             fs_ops: 0,
+            new_items: 0,
             has_skipped: false,
         };
         assert_eq!(format_untag_result(&resp), "Deleted tags: 3, files: 0.");

@@ -105,6 +105,8 @@ pub struct InteractiveHinter {
     transient_message: Option<(String, Instant)>,
     ghost_slot: Option<String>,
     last_query: String,
+    searched_query: Option<String>,
+    untag_query: Option<String>,
     last_path: String,
     last_computed_hint: String,
     completion: Arc<Mutex<CompletionState>>,
@@ -119,6 +121,8 @@ impl Default for InteractiveHinter {
             transient_message: None,
             ghost_slot: None,
             last_query: DEFAULT_QUERY.to_string(),
+            searched_query: None,
+            untag_query: None,
             last_path: ".".to_string(),
             last_computed_hint: String::new(),
             completion: Arc::new(Mutex::new(CompletionState::new())),
@@ -138,6 +142,14 @@ impl InteractiveHinter {
 
     pub fn set_last_query(&mut self, query: &str) {
         self.last_query = query.to_string();
+    }
+
+    pub fn set_searched_query(&mut self, query: Option<String>) {
+        self.searched_query = query;
+    }
+
+    pub fn set_untag_query(&mut self, query: Option<String>) {
+        self.untag_query = query;
     }
 
     pub fn set_last_path(&mut self, path: &str) {
@@ -294,15 +306,17 @@ impl InteractiveHinter {
     }
 
     fn hint_edit_query_trace(&mut self, trimmed: &str) -> Option<String> {
-        if trimmed != "t" && trimmed != "u" {
-            return None;
-        }
-        if self.last_query.is_empty() {
+        let query = match trimmed {
+            "t" => self.searched_query.as_deref(),
+            "u" => self.untag_query.as_deref(),
+            _ => return None,
+        }?;
+        if query.is_empty() {
             self.with_state_mut(|s| s.clear_ghost());
             return Some(String::new());
         }
         self.with_state_mut(|s| s.enter_ghost());
-        let escaped = self.last_query.replace('"', "\\\"");
+        let escaped = query.replace('"', "\\\"");
         Some(format!(" \"{escaped}\" "))
     }
 
@@ -572,6 +586,33 @@ mod tests {
         hinter.completion_state().lock().unwrap().enter_ghost();
         assert_eq!(hinter.handle_line("s ext", 5), "ension:");
         assert!(calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(hinter.phase(), CompletionPhase::GhostActive);
+    }
+
+    #[test]
+    fn test_hinter_untag_trace_uses_untag_query() {
+        let mut hinter = InteractiveHinter::new();
+        hinter.set_searched_query(Some("project:".to_string()));
+        hinter.set_untag_query(None);
+        assert_eq!(hinter.handle_line("u", 1), "");
+        assert_eq!(hinter.handle_line("t", 1), " \"project:\" ");
+    }
+
+    #[test]
+    fn test_hinter_edit_query_trace_suppressed_when_searched_query_none() {
+        let mut hinter = InteractiveHinter::new();
+        hinter.set_last_query(DEFAULT_QUERY);
+        hinter.set_searched_query(None);
+
+        assert_eq!(hinter.handle_line("s", 1), " *:*");
+        assert_eq!(hinter.handle_line("t", 1), "");
+        assert_eq!(hinter.handle_line("u", 1), "");
+        assert_eq!(hinter.phase(), CompletionPhase::Off);
+
+        hinter.set_searched_query(Some("project:alpha".to_string()));
+        hinter.set_untag_query(Some("project:alpha".to_string()));
+        assert_eq!(hinter.handle_line("t", 1), " \"project:alpha\" ");
+        assert_eq!(hinter.handle_line("u", 1), " \"project:alpha\" ");
         assert_eq!(hinter.phase(), CompletionPhase::GhostActive);
     }
 }

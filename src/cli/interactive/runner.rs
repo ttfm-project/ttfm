@@ -84,6 +84,7 @@ pub fn floor_char_boundary(s: &str, mut index: usize) -> usize {
 
 pub type CandidateFetcher = Box<dyn Fn(&str, usize) -> Vec<Candidate> + Send>;
 pub type LastQueryProvider = Box<dyn Fn() -> String + Send>;
+pub type SearchedQueryProvider = Box<dyn Fn() -> Option<String> + Send>;
 pub type EscapeHandler = Box<dyn Fn() -> bool + Send>;
 
 pub struct PagingColumnarMenu {
@@ -212,6 +213,23 @@ impl MenuBuilder for PagingColumnarMenu {
     }
 }
 
+pub fn can_quick_complete_values(
+    line: &str,
+    pos: usize,
+    values: &[Suggestion],
+) -> bool {
+    let [only] = values else {
+        return false;
+    };
+    crate::autocomplete::ghost_suffix_for_span(
+        line,
+        pos,
+        (only.span.start, only.span.end),
+        &only.value,
+    )
+    .is_some()
+}
+
 impl Menu for PagingColumnarMenu {
     fn settings(&self) -> &MenuSettings {
         self.inner.settings()
@@ -222,12 +240,12 @@ impl Menu for PagingColumnarMenu {
     }
 
     fn can_quick_complete(&self) -> bool {
-        self.inner.can_quick_complete()
+        false
     }
 
     fn can_partially_complete(
         &mut self,
-        values_updated: bool,
+        _values_updated: bool,
         editor: &mut reedline::Editor,
         completer: &mut dyn reedline::Completer,
     ) -> bool {
@@ -238,17 +256,22 @@ impl Menu for PagingColumnarMenu {
             return false;
         }
         self.allow_partial = false;
+        if self.capture_base {
+            self.update_values(editor, completer);
+            self.inner.menu_event(MenuEvent::Activate(true));
+        }
         let values = self.inner.get_values();
-        if values.is_empty()
+        if can_quick_complete_values(&self.base_line, self.base_pos, values) {
+            self.inner.replace_in_buffer(editor);
+            self.menu_event(MenuEvent::Deactivate);
+            return true;
+        }
+        if values.len() <= 1
             || values.iter().any(|s| s.span.start == s.span.end)
         {
             return false;
         }
-        let did = self.inner.can_partially_complete(
-            values_updated,
-            editor,
-            completer,
-        );
+        let did = self.inner.can_partially_complete(true, editor, completer);
         if did {
             self.base_line = editor.get_buffer().to_string();
             self.base_pos = editor.line_buffer().insertion_point();
@@ -325,8 +348,14 @@ impl Menu for PagingColumnarMenu {
                 self.page_fetch_in_flight = false;
                 self.select_last_on_fetch = false;
                 self.capture_base = true;
-                self.allow_partial = matches!(event, MenuEvent::Activate(_));
-                self.inner.menu_event(event);
+                let is_activate = matches!(event, MenuEvent::Activate(_));
+                self.allow_partial = is_activate;
+                let inner_ev = if is_activate {
+                    MenuEvent::Activate(false)
+                } else {
+                    MenuEvent::Edit(false)
+                };
+                self.inner.menu_event(inner_ev);
             }
             MenuEvent::Deactivate => {
                 self.current_offset.store(0, Ordering::SeqCst);
@@ -400,6 +429,8 @@ impl Menu for PagingColumnarMenu {
 pub struct InteractiveCompleter {
     pub fetcher: CandidateFetcher,
     pub last_query_provider: LastQueryProvider,
+    pub searched_query_provider: Option<SearchedQueryProvider>,
+    pub untag_query_provider: Option<SearchedQueryProvider>,
     pub last_path_provider: Option<LastQueryProvider>,
     pub hinter: Arc<Mutex<InteractiveHinter>>,
     current_offset: Option<Arc<AtomicUsize>>,
@@ -415,6 +446,8 @@ impl InteractiveCompleter {
         Self {
             fetcher,
             last_query_provider: Box::new(move || q.clone()),
+            searched_query_provider: None,
+            untag_query_provider: None,
             last_path_provider: None,
             hinter: Arc::new(Mutex::new(InteractiveHinter::new())),
             current_offset: None,
@@ -429,6 +462,24 @@ impl InteractiveCompleter {
         Self {
             fetcher,
             last_query_provider: provider,
+            searched_query_provider: None,
+            untag_query_provider: None,
+            last_path_provider: None,
+            hinter: Arc::new(Mutex::new(InteractiveHinter::new())),
+            current_offset: None,
+            query_base: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn with_query_provider(
+        fetcher: CandidateFetcher,
+        provider: SearchedQueryProvider,
+    ) -> Self {
+        Self {
+            fetcher,
+            last_query_provider: Box::new(|| String::new()),
+            searched_query_provider: Some(provider),
+            untag_query_provider: None,
             last_path_provider: None,
             hinter: Arc::new(Mutex::new(InteractiveHinter::new())),
             current_offset: None,
@@ -445,11 +496,29 @@ impl InteractiveCompleter {
         Self {
             fetcher,
             last_query_provider: query_provider,
+            searched_query_provider: None,
+            untag_query_provider: None,
             last_path_provider: Some(path_provider),
             hinter,
             current_offset: None,
             query_base: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn with_searched_query_provider(
+        mut self,
+        provider: SearchedQueryProvider,
+    ) -> Self {
+        self.searched_query_provider = Some(provider);
+        self
+    }
+
+    pub fn with_untag_query_provider(
+        mut self,
+        provider: SearchedQueryProvider,
+    ) -> Self {
+        self.untag_query_provider = Some(provider);
+        self
     }
 
     pub fn with_paging_offset(mut self, offset: Arc<AtomicUsize>) -> Self {
@@ -553,22 +622,35 @@ impl reedline::Completer for InteractiveCompleter {
             if (trimmed == "t" || trimmed == "u")
                 && (line.trim() == "t" || line.trim() == "u")
             {
-                let last_query = (self.last_query_provider)();
-                if !last_query.is_empty() {
-                    let escaped = last_query.replace('"', "\\\"");
-                    return vec![reedline::Suggestion {
-                        value: format!(" \"{escaped}\" "),
-                        description: None,
-                        extra: None,
-                        span: reedline::Span {
-                            start: pos,
-                            end: pos,
-                        },
-                        append_whitespace: false,
-                        display_override: None,
-                        match_indices: None,
-                        style: None,
-                    }];
+                let query_opt = if trimmed == "u" {
+                    self.untag_query_provider.as_ref().and_then(|p| (p)())
+                } else if let Some(ref p) = self.searched_query_provider {
+                    (p)()
+                } else {
+                    let q = (self.last_query_provider)();
+                    if q.is_empty() {
+                        None
+                    } else {
+                        Some(q)
+                    }
+                };
+                if let Some(query) = query_opt {
+                    if !query.is_empty() {
+                        let escaped = query.replace('"', "\\\"");
+                        return vec![reedline::Suggestion {
+                            value: format!(" \"{escaped}\" "),
+                            description: None,
+                            extra: None,
+                            span: reedline::Span {
+                                start: pos,
+                                end: pos,
+                            },
+                            append_whitespace: false,
+                            display_override: None,
+                            match_indices: None,
+                            style: None,
+                        }];
+                    }
                 }
             }
         }
@@ -632,6 +714,12 @@ fn event_clears_completion(
             cmds.iter().any(edit_command_clears_completion)
         }
         ReedlineEvent::UntilFound(events) => {
+            if events
+                .iter()
+                .any(|e| matches!(e, ReedlineEvent::HistoryHintComplete))
+            {
+                return false;
+            }
             let moves = events.iter().any(|e| {
                 matches!(
                     e,
@@ -836,11 +924,31 @@ pub fn build_keybindings() -> reedline::Keybindings {
         KeyModifiers::NONE,
         KeyCode::Right,
         ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::HistoryHintComplete,
             ReedlineEvent::MenuRight,
             ReedlineEvent::Right,
         ]),
     );
     keybindings
+}
+
+pub fn sync_hinter_state(
+    hinter: &Arc<Mutex<InteractiveHinter>>,
+    state: &State,
+    fallback: &str,
+) {
+    if let Ok(mut h) = hinter.lock() {
+        let searched = state.last_query().map(str::to_string);
+        let search_q = state.last_query().unwrap_or(fallback);
+        let search_q = if search_q.is_empty() {
+            DEFAULT_QUERY
+        } else {
+            search_q
+        };
+        h.set_last_query(search_q);
+        h.set_searched_query(searched);
+        h.set_untag_query(state.last_untag_query().map(str::to_string));
+    }
 }
 
 pub fn sync_hinter_last_query(
@@ -852,6 +960,7 @@ pub fn sync_hinter_last_query(
         let q = last_query.unwrap_or(fallback);
         let q = if q.is_empty() { DEFAULT_QUERY } else { q };
         h.set_last_query(q);
+        h.set_searched_query(last_query.map(str::to_string));
     }
 }
 
@@ -882,11 +991,20 @@ pub fn run_interactive_terminal(
     let shared_offset = Arc::new(AtomicUsize::new(0));
     let offset_for_fetcher = Arc::clone(&shared_offset);
     let reg_for_fetcher = registry.clone();
+    pub const DEFAULT_INTERACTIVE_COMPLETION_LIMIT: usize = 40;
+
     let store_for_fetcher = store.try_clone().ok();
     let fetcher: CandidateFetcher = Box::new(move |line: &str, pos: usize| {
         if let Some(ref st) = store_for_fetcher {
             let cur_offset = offset_for_fetcher.load(Ordering::SeqCst);
-            fetch_candidates(st, &reg_for_fetcher, line, pos, cur_offset, 10)
+            fetch_candidates(
+                st,
+                &reg_for_fetcher,
+                line,
+                pos,
+                cur_offset,
+                DEFAULT_INTERACTIVE_COMPLETION_LIMIT,
+            )
         } else {
             vec![]
         }
@@ -926,6 +1044,22 @@ pub fn run_interactive_terminal(
         default_q_for_provider.clone()
     });
 
+    let state_for_searched_provider = Arc::clone(&state);
+    let searched_query_provider: SearchedQueryProvider = Box::new(move || {
+        state_for_searched_provider
+            .lock()
+            .ok()
+            .and_then(|st| st.last_query().map(str::to_string))
+    });
+
+    let state_for_untag_provider = Arc::clone(&state);
+    let untag_query_provider: SearchedQueryProvider = Box::new(move || {
+        state_for_untag_provider
+            .lock()
+            .ok()
+            .and_then(|st| st.last_untag_query().map(str::to_string))
+    });
+
     let path_for_provider = Arc::clone(&last_path);
     let path_provider: LastQueryProvider = Box::new(move || {
         path_for_provider
@@ -944,6 +1078,8 @@ pub fn run_interactive_terminal(
         path_provider,
         Arc::clone(&hinter),
     )
+    .with_searched_query_provider(searched_query_provider)
+    .with_untag_query_provider(untag_query_provider)
     .with_paging_offset(Arc::clone(&shared_offset));
     let columnar_menu = ColumnarMenu::default().with_name("completion_menu");
     let completion_state = hinter
@@ -952,9 +1088,13 @@ pub fn run_interactive_terminal(
         .unwrap_or_else(|_| Arc::new(Mutex::new(CompletionState::new())));
     let query_base = completer.shared_query_base();
     let paging_menu = Box::new(
-        PagingColumnarMenu::new(columnar_menu, Arc::clone(&shared_offset), 10)
-            .with_completion_state(completion_state)
-            .with_query_base(query_base),
+        PagingColumnarMenu::new(
+            columnar_menu,
+            Arc::clone(&shared_offset),
+            DEFAULT_INTERACTIVE_COMPLETION_LIMIT,
+        )
+        .with_completion_state(completion_state)
+        .with_query_base(query_base),
     );
 
     let mut line_editor = Reedline::create()
@@ -999,6 +1139,13 @@ pub fn run_interactive_terminal(
     }
 
     loop {
+        if let Ok(st) = state.lock() {
+            sync_hinter_state(
+                &hinter,
+                &st,
+                initial_query.unwrap_or(DEFAULT_QUERY),
+            );
+        }
         if let Ok(mut h) = hinter.lock() {
             h.reset();
         }
@@ -1040,11 +1187,7 @@ pub fn run_interactive_terminal(
                         match dispatch_res {
                             Ok(cont) => {
                                 if let Ok(st) = state.lock() {
-                                    sync_hinter_last_query(
-                                        &hinter,
-                                        st.last_query(),
-                                        &default_q,
-                                    );
+                                    sync_hinter_state(&hinter, &st, &default_q);
                                 }
                                 if let Ok(lp) = last_path.lock() {
                                     if let Ok(mut h) = hinter.lock() {
@@ -1245,10 +1388,49 @@ mod tests {
         assert_eq!(
             event,
             ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::HistoryHintComplete,
                 ReedlineEvent::MenuRight,
                 ReedlineEvent::Right,
             ])
         );
+    }
+
+    #[test]
+    fn test_edit_mode_accept_keys_preserve_ghost_active_phase() {
+        let hinter = Arc::new(Mutex::new(InteractiveHinter::new()));
+        hinter.lock().unwrap().set_last_query("extension:rs");
+        hinter.lock().unwrap().handle_line("s", 1);
+        assert_eq!(
+            hinter.lock().unwrap().phase(),
+            CompletionPhase::GhostActive
+        );
+
+        let mut mode = InteractiveEditMode::new(Emacs::default());
+        mode.set_hinter(Arc::clone(&hinter));
+
+        let kb = build_keybindings();
+        let right_ev =
+            kb.find_binding(KeyModifiers::NONE, KeyCode::Right).unwrap();
+        let res = mode.handle_reedline_event(right_ev.clone());
+        assert_eq!(res, right_ev);
+        assert_eq!(
+            hinter.lock().unwrap().phase(),
+            CompletionPhase::GhostActive
+        );
+
+        let ctrl_f = kb
+            .find_binding(KeyModifiers::CONTROL, KeyCode::Char('f'))
+            .unwrap();
+        let res = mode.handle_reedline_event(ctrl_f.clone());
+        assert_eq!(res, ctrl_f);
+        assert_eq!(
+            hinter.lock().unwrap().phase(),
+            CompletionPhase::GhostActive
+        );
+
+        let left_ev = ReedlineEvent::Left;
+        let _ = mode.handle_reedline_event(left_ev);
+        assert_eq!(hinter.lock().unwrap().phase(), CompletionPhase::Off);
     }
 }
 
@@ -1340,7 +1522,7 @@ mod runner_state_tests {
 
         hinter.lock().unwrap().set_last_query("extension:rs");
         let mut state = State::new();
-        state.to_searched("project:alpha".into(), None, 1, None, false);
+        state.to_searched("project:alpha".into(), true, None, 1, None, false);
         sync_hinter_last_query(&hinter, state.last_query(), DEFAULT_QUERY);
         assert_eq!(
             hinter.lock().unwrap().handle_line("s", 1),
@@ -1352,7 +1534,7 @@ mod runner_state_tests {
         sync_hinter_last_query(&hinter, state.last_query(), DEFAULT_QUERY);
         assert_eq!(hinter.lock().unwrap().handle_line("s", 1), " *:*");
 
-        state.to_searched("project:alpha".into(), None, 1, None, false);
+        state.to_searched("project:alpha".into(), true, None, 1, None, false);
         sync_hinter_last_query(&hinter, state.last_query(), "filename:a.txt");
         state.clear();
         sync_hinter_last_query(&hinter, state.last_query(), "filename:a.txt");
@@ -1387,5 +1569,67 @@ mod runner_state_tests {
         let calls = seen.lock().unwrap();
         assert_eq!(calls[0], ("s ".into(), 2));
         assert_eq!(calls[1], ("s ".into(), 2));
+    }
+
+    #[test]
+    fn test_interactive_completer_untag_uses_untag_query_provider() {
+        let fetcher = Box::new(|_line: &str, _pos: usize| vec![]);
+        let mut completer = InteractiveCompleter::with_query_provider(
+            fetcher,
+            Box::new(|| Some("project:".to_string())),
+        )
+        .with_untag_query_provider(Box::new(|| None));
+
+        assert!(completer.complete("u", 1).is_empty());
+        assert_eq!(completer.complete("t", 1)[0].value, " \"project:\" ");
+    }
+
+    #[test]
+    fn test_interactive_completer_suppresses_edit_query_in_init_state() {
+        let fetcher = Box::new(|_line: &str, _pos: usize| vec![]);
+        let searched_q = Arc::new(Mutex::new(None));
+        let provider_q = Arc::clone(&searched_q);
+        let mut completer = InteractiveCompleter::with_query_provider(
+            fetcher,
+            Box::new(move || provider_q.lock().unwrap().clone()),
+        );
+
+        let res_t = completer.complete("t", 1);
+        assert!(res_t.is_empty());
+        let res_u = completer.complete("u", 1);
+        assert!(res_u.is_empty());
+
+        *searched_q.lock().unwrap() = Some("project:alpha".to_string());
+        let res_t2 = completer.complete("t", 1);
+        assert_eq!(res_t2.len(), 1);
+        assert_eq!(res_t2[0].value, " \"project:alpha\" ");
+    }
+
+    #[test]
+    fn test_sync_hinter_suppresses_edit_ghost_when_state_returns_to_init() {
+        let hinter = Arc::new(Mutex::new(InteractiveHinter::new()));
+        let mut state = State::new();
+
+        sync_hinter_state(&hinter, &state, DEFAULT_QUERY);
+        assert_eq!(hinter.lock().unwrap().handle_line("s", 1), " *:*");
+        assert_eq!(hinter.lock().unwrap().handle_line("t", 1), "");
+        assert_eq!(hinter.lock().unwrap().handle_line("u", 1), "");
+
+        state.to_searched("project:alpha".into(), true, None, 1, None, false);
+        sync_hinter_state(&hinter, &state, DEFAULT_QUERY);
+        assert_eq!(
+            hinter.lock().unwrap().handle_line("t", 1),
+            " \"project:alpha\" "
+        );
+        assert_eq!(
+            hinter.lock().unwrap().handle_line("u", 1),
+            " \"project:alpha\" "
+        );
+
+        state.clear();
+        sync_hinter_state(&hinter, &state, DEFAULT_QUERY);
+        assert_eq!(hinter.lock().unwrap().handle_line("s", 1), " *:*");
+        assert_eq!(hinter.lock().unwrap().handle_line("t", 1), "");
+        assert_eq!(hinter.lock().unwrap().handle_line("u", 1), "");
     }
 }

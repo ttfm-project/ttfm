@@ -20,6 +20,7 @@ pub enum State {
     Init,
     Searched {
         query: String,
+        returns_items: bool,
         cid: Option<String>,
         page_start: usize,
         offset: usize,
@@ -38,6 +39,7 @@ impl State {
     pub fn to_searched(
         &mut self,
         query: String,
+        returns_items: bool,
         cid: Option<String>,
         fetched_len: usize,
         total_count: Option<usize>,
@@ -45,6 +47,7 @@ impl State {
     ) {
         self.to_searched_at_page(
             query,
+            returns_items,
             cid,
             0,
             fetched_len,
@@ -53,9 +56,11 @@ impl State {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn to_searched_at_page(
         &mut self,
         query: String,
+        returns_items: bool,
         cid: Option<String>,
         page_start: usize,
         fetched_len: usize,
@@ -64,6 +69,7 @@ impl State {
     ) {
         *self = State::Searched {
             query,
+            returns_items,
             cid,
             page_start,
             offset: page_start + fetched_len,
@@ -82,6 +88,17 @@ impl State {
         match self {
             State::Init => None,
             State::Searched { query, .. } => Some(query.as_str()),
+        }
+    }
+
+    pub fn last_untag_query(&self) -> Option<&str> {
+        match self {
+            State::Searched {
+                query,
+                returns_items: true,
+                ..
+            } => Some(query.as_str()),
+            _ => None,
         }
     }
 
@@ -153,6 +170,7 @@ mod tests {
 
         s.to_searched(
             "extension:rs".to_string(),
+            true,
             Some("cid-1".to_string()),
             20,
             None,
@@ -161,7 +179,14 @@ mod tests {
         assert_eq!(s.prompt_string(), "[extension:rs] ");
         assert_eq!(s.last_query(), Some("extension:rs"));
 
-        s.to_searched("extension:rs".to_string(), None, 5, Some(5), false);
+        s.to_searched(
+            "extension:rs".to_string(),
+            true,
+            None,
+            5,
+            Some(5),
+            false,
+        );
         assert_eq!(s.prompt_string(), "[extension:rs] ");
 
         s.clear();
@@ -174,7 +199,15 @@ mod tests {
         assert_eq!(s.current_col_offset(), 0);
         assert!(!s.can_prev_cols());
 
-        s.to_searched_at_page("ext:rs".to_string(), None, 0, 20, None, true);
+        s.to_searched_at_page(
+            "ext:rs".to_string(),
+            true,
+            None,
+            0,
+            20,
+            None,
+            true,
+        );
         assert_eq!(s.current_col_offset(), 0);
         assert!(!s.can_prev_cols());
 
@@ -198,7 +231,15 @@ mod tests {
 
         // Reset on to_searched_at_page
         s.push_col_offset(4);
-        s.to_searched_at_page("ext:rs".to_string(), None, 20, 20, None, true);
+        s.to_searched_at_page(
+            "ext:rs".to_string(),
+            true,
+            None,
+            20,
+            20,
+            None,
+            true,
+        );
         assert_eq!(s.current_col_offset(), 0);
         assert!(!s.can_prev_cols());
     }

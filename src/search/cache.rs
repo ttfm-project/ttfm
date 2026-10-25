@@ -891,7 +891,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_generation_and_read_use_tags_dictionary() -> Result<()> {
+    fn test_cache_count_uses_dictionary_and_mixed_pick_reads_stored(
+    ) -> Result<()> {
         let dir = tempdir()?;
         let db_dir = dir.path().join("db");
         std::fs::create_dir_all(&db_dir)?;
@@ -913,10 +914,15 @@ mod tests {
         )?
         .to_string(PostgresQueryBuilder);
         assert!(
-            sql.contains("hive_partitioning") || sql.contains("type=project"),
+            sql.contains("\"stored\"") && sql.contains("project:a*"),
             "{sql}"
         );
+        assert!(sql.contains("oneview"), "{sql}");
         assert!(!sql.contains("user_tags"), "{sql}");
+        assert!(
+            !sql.contains("hive_partitioning") && !sql.contains("type=project"),
+            "{sql}"
+        );
         let fetched = crate::query::lens_resolver::Resolver::from_node(
             crate::query::parser::parse_nowarn("count(tag:\"project:a*\")")?,
             &registry,

@@ -139,11 +139,17 @@ Remaining features, optimizations, and long-term vision.
 - [ ] **Remote Support**: Integrate `RemoteID` (ETag/VersionID) for online files.
 - [x] **Unique Tag Types**: Implemented via `strategy:replace` on Type definitions (ADR 0029) to enforce single-valued tags.
 - [ ] **Multi-Origin Tag Coexistence**: Support the coexistence of same-named tags across different origins (User, Plugin, and Builtin/System) without destructive overwrites, enabling origin-scoped disambiguation and query resolution.
+- [ ] **File Removal / Trash Operations**: Support physical deletion or safe trashing of files matching a query (e.g., `ttfm rm <QUERY>`), including automated cleanup of file references in the database and interactive confirmation.
 
 ### Search & UI Enhancements
 - [ ] **Sorting**: Sort results by Size, Date Modified, or Name.
 - [ ] **Output Formats**: Support JSON output.
 - [ ] **Rank Display Scaling**: Decimal representation of BigInt ranks.
+- [ ] **Rank Management by Category**: Manage rank by category and order search results by category first, so that `*:*` shows the items the user works with ahead of definition items.
+    - Category order: items registered by the user's decision (notes, registered type/tag definitions) > files (`item_kind:file`, including directories and removed files) > unregistered definition items (builtin `Sys(n)`, plugin types, Volatile type/tag definitions).
+    - Within a category, items keep their own rank (`SystemRank` for types). Column order uses only the type's own rank and is not affected by the category.
+    - A user-assigned `rank` is added to the system rank instead of replacing it (ADR 0022), so it adjusts the item within its category.
+- [ ] **Initial Rank of Files and User-Registered Items**: Adjust the initial rank of files and user-registered items so that they precede definition items. Both are currently 0, below builtin types with a positive `SystemRank` such as `name` (10) and `size` (8).
 - [ ] **UI/UX Improvements**:
     - Tab completion (CLI) and Search Suggestions (GUI).
       - Suggestions search the full `type:label` tag string and use progressive lazy search with deduplication, appending results to the displayed list as each phase completes:

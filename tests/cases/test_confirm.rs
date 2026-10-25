@@ -521,3 +521,181 @@ fn hardlink_all_moves_all_links_to_new_directory() {
     assert!(new_dir.join("a.txt").exists());
     assert!(new_dir.join("a_sub.txt").exists());
 }
+
+#[test]
+fn untag_confirm_counts_only_items_it_can_untag() {
+    let (store, registry, _d, _root) = setup(&["a.txt"]);
+    tag_item(&store, &registry, "filename:a.txt", "project:A");
+    let mut prompt = MockPrompt {
+        answer: true,
+        conflict_answer: ConflictChoice::Abort,
+        hardlink_answer: HardlinkChoice::Abort,
+        replace_answer: None,
+        mkdir_answer: true,
+        recorded_summary: None,
+    };
+    edit_with_prompt(
+        &store,
+        &registry,
+        "*:*",
+        Some("project:A"),
+        QueryType::Untag,
+        None,
+        WriteOptions::interactive().on_confirm(ConfirmMode::Always),
+        &mut Vec::new(),
+        &mut prompt,
+    )
+    .unwrap();
+    let stored = find(&store, &registry, "item_id:*").len();
+    assert_eq!(prompt.recorded_summary.unwrap().matched_items, stored);
+}
+
+#[test]
+fn replace_tag_counts_one_modification_per_label() {
+    let (store, registry, _d, _root) = setup(&["a.txt", "b.txt"]);
+    tag_item(&store, &registry, "type:status", "strategy:replace");
+    let mut prompt = MockPrompt {
+        answer: true,
+        conflict_answer: ConflictChoice::Abort,
+        hardlink_answer: HardlinkChoice::Abort,
+        replace_answer: None,
+        mkdir_answer: true,
+        recorded_summary: None,
+    };
+    edit_with_prompt(
+        &store,
+        &registry,
+        "extension:txt",
+        Some("status:done"),
+        QueryType::Tag,
+        None,
+        WriteOptions::interactive().on_confirm(ConfirmMode::Always),
+        &mut Vec::new(),
+        &mut prompt,
+    )
+    .unwrap();
+    assert_eq!(prompt.recorded_summary.unwrap().tag_ops, 2);
+}
+
+#[test]
+fn replace_conflict_counts_one_modification_per_label() {
+    let (store, registry, _d, _root) = setup(&["beta.txt"]);
+    tag_item(&store, &registry, "type:status", "strategy:replace");
+    tag_item(
+        &store,
+        &registry,
+        "filename:beta.txt",
+        "project:ttfm project:other",
+    );
+    let mut prompt = MockPrompt {
+        answer: true,
+        conflict_answer: ConflictChoice::Abort,
+        hardlink_answer: HardlinkChoice::Abort,
+        replace_answer: Some(ReplaceChoice {
+            label: Label::from("ttfm"),
+            for_all: false,
+        }),
+        mkdir_answer: true,
+        recorded_summary: None,
+    };
+    edit_with_prompt(
+        &store,
+        &registry,
+        "filename:beta.txt & project:*",
+        Some("status:{1}"),
+        QueryType::Tag,
+        None,
+        WriteOptions::interactive().on_confirm(ConfirmMode::Always),
+        &mut Vec::new(),
+        &mut prompt,
+    )
+    .unwrap();
+    assert_eq!(prompt.recorded_summary.unwrap().tag_ops, 1);
+}
+
+#[test]
+fn unmaterialized_item_counts_one_modification_per_label() {
+    let (store, registry, _d, _root) = setup(&["beta.txt"]);
+    tag_item(&store, &registry, "filename:beta.txt", "project:ttfm");
+    let mut prompt = MockPrompt {
+        answer: true,
+        conflict_answer: ConflictChoice::Abort,
+        hardlink_answer: HardlinkChoice::Abort,
+        replace_answer: None,
+        mkdir_answer: true,
+        recorded_summary: None,
+    };
+    edit_with_prompt(
+        &store,
+        &registry,
+        "tag:\"project:ttfm\"",
+        Some("rank:100 memo:x"),
+        QueryType::Tag,
+        None,
+        WriteOptions::interactive().on_confirm(ConfirmMode::Always),
+        &mut Vec::new(),
+        &mut prompt,
+    )
+    .unwrap();
+    assert_eq!(prompt.recorded_summary.unwrap().tag_ops, 2);
+}
+
+#[test]
+fn piped_stdin_without_yes_asks_confirmation() -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let ttfm_bin = env!("CARGO_BIN_EXE_ttfm");
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let ttfm_home = root.join(".ttfm");
+    let files = root.join("files");
+    std::fs::create_dir_all(&files)?;
+    std::fs::write(files.join("notes.md"), "x")?;
+    std::fs::write(files.join("beta.txt"), "b")?;
+    let run =
+        |args: &[&str], input: &str| -> anyhow::Result<std::process::Output> {
+            let mut child = Command::new(ttfm_bin)
+                .env("TTFM_HOME", &ttfm_home)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(input.as_bytes())?;
+            Ok(child.wait_with_output()?)
+        };
+
+    run(&["index", files.to_str().unwrap()], "")?;
+    run(&["-y", "tag", "filename:notes.md", "project:cx2"], "")?;
+
+    let cancelled = run(&["untag", "*:*", "project:cx2"], "n\n")?;
+    assert!(String::from_utf8_lossy(&cancelled.stderr)
+        .contains("Apply these changes? [y/N]: "));
+    let kept = run(&["search", "--short", "project:"], "")?;
+    assert!(String::from_utf8_lossy(&kept.stdout).contains("cx2"));
+
+    run(&["-y", "untag", "*:*", "project:cx2"], "")?;
+    let removed = run(&["search", "--short", "project:"], "")?;
+    assert!(!String::from_utf8_lossy(&removed.stdout).contains("cx2"));
+
+    run(&["-y", "tag", "type:status", "strategy:replace"], "")?;
+    run(
+        &[
+            "-y",
+            "tag",
+            "filename:beta.txt",
+            "project:ttfm project:other",
+        ],
+        "",
+    )?;
+    let chosen = run(
+        &["tag", "filename:beta.txt & project:*", "status:{1}"],
+        "2\ny\n",
+    )?;
+    assert!(String::from_utf8_lossy(&chosen.stderr).contains("Choice [1-4]: "));
+    let status =
+        run(&["search", "--short", "filename:beta.txt & status:"], "")?;
+    assert!(String::from_utf8_lossy(&status.stdout).contains("ttfm"));
+    Ok(())
+}

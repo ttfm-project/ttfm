@@ -106,9 +106,9 @@ comparison = {
 // (sum(size:) + 100) > 1000 falls through to scalar_comparison.
 // nest_parenthesized_expr allows ((nest_expr)) with arbitrary parenthesis depth.
 label_comparison = ${
-    ( (nest_expr | nest_parenthesized_expr | type_ref | calculation | label_calc) ~ (WHITESPACE+ ~ label_op)+ )
+    ( (nest_expr | nest_parenthesized_expr | type_ref | calculation | label_calc | parenthesized_expr) ~ (WHITESPACE+ ~ label_op)+ )
   | ( (nest_expr | nest_parenthesized_expr | type_ref | label_calc) ~ stuck_op_step ~ (WHITESPACE+ ~ label_op)* )
-  | ( (number | quoted_string | unquoted_string | unquoted_tag_string | label_calc) ~ (WHITESPACE+ ~ label_op_to_proj) ~ (WHITESPACE+ ~ label_op)* )
+  | ( (number | quoted_string | item_id_literal | unquoted_string | unquoted_tag_string | label_calc) ~ (WHITESPACE+ ~ label_op_to_proj) ~ (WHITESPACE+ ~ label_op)* )
 }
 
 // Allows arbitrarily nested parentheses around a nest_expr on label_comparison left side.
@@ -120,13 +120,13 @@ nest_parenthesized_expr = { "(" ~ WHITESPACE* ~ (nest_parenthesized_expr | nest_
 // Label colon operator: :=, :^, :^=, :>, :>=, :<, :<=
 // DESIGN.md:71 - Label equality uses single "=" not "=="
 label_op = ${ colon ~ label_basic_op ~ WHITESPACE+ ~ operand }
-label_op_to_proj = ${ colon ~ label_basic_op ~ WHITESPACE+ ~ (type_ref | calculation) }
+label_op_to_proj = ${ colon ~ label_basic_op ~ WHITESPACE+ ~ (nest_expr | nest_parenthesized_expr | type_ref | calculation | parenthesized_expr) }
 
 // Stuck operator: ^, ^=, >, >=, <, <= (NO equality operator)
 // DESIGN.md:86,91 - Stuck comparison does NOT have = or == since TypedTag achieves same result
 // DESIGN.md:88 - NO whitespace allowed between operator and operand
 stuck_op_step = ${ stuck_basic_op ~ stuck_operand }
-stuck_operand = { quoted_string | number | scalar_calculation | unquoted_tag_string }
+stuck_operand = { quoted_string | number | item_id_literal | scalar_calculation | unquoted_tag_string }
 
 colon = { ":" }
 
@@ -173,7 +173,7 @@ aggregator = @{ "sum" | "count" | "avg" | "max" | "min" }
 // ... existing rules ...
 
 // Tag Label (permissive, allows ^)
-tag_label = { quoted_string | number | unquoted_tag_string }
+tag_label = { quoted_string | number | item_id_literal | unquoted_tag_string }
 
 // ... existing unquoted_string ...
 
@@ -216,7 +216,7 @@ type_ref = ${ tag_type ~ ":" }
 tag_type = ${ quoted_string | identifier }
 
 // --- Labels and Literals ---
-label = { quoted_string | number | (!type_ref ~ unquoted_string) }
+label = { quoted_string | number | item_id_literal | (!type_ref ~ unquoted_string) }
 
 // Numbers
 number = @{ "-"? ~ ASCII_DIGIT+ ~ &(WHITESPACE | EOI | ")") }

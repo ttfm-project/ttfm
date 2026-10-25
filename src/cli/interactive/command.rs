@@ -394,8 +394,17 @@ fn execute_search_and_render<W: Write, E: Write>(
         print_menu(output, state)?;
         return Ok(());
     }
+    let returns_items = match state {
+        State::Searched {
+            query: q,
+            returns_items,
+            ..
+        } if q == query => *returns_items,
+        _ => crate::search::returns_items(store, registry, query)?,
+    };
     state.to_searched_at_page(
         query.to_string(),
+        returns_items,
         resp.cid.clone(),
         page_start,
         resp.results.len(),
@@ -721,7 +730,7 @@ Key bindings:
   Shift+Tab / BackTab Cycle completion candidates backward
   Enter               Submit command line (or accept ghost text if tracing)
   Esc                 Cancel completion (keep line) / clear line / return
-  Right / Ctrl+F      Accept single ghost text token
+  Right / Ctrl+F      Accept ghost text
 ";
 
 pub fn print_help<W: Write>(out: &mut W) -> std::io::Result<()> {
@@ -1180,7 +1189,14 @@ mod tests {
 
         let mut out_searched = Vec::new();
         let mut searched_state = State::new();
-        searched_state.to_searched("foo".to_string(), None, 0, Some(10), false);
+        searched_state.to_searched(
+            "foo".to_string(),
+            true,
+            None,
+            0,
+            Some(10),
+            false,
+        );
         print_menu(&mut out_searched, &searched_state).unwrap();
         let s_searched = String::from_utf8(out_searched).unwrap();
         assert!(!s_searched.contains("Examples:"));
@@ -1195,6 +1211,7 @@ mod tests {
         let mut st_first = State::new();
         st_first.to_searched_at_page(
             "foo".to_string(),
+            true,
             None,
             0,
             20,
@@ -1213,6 +1230,7 @@ mod tests {
         let mut st_second = State::new();
         st_second.to_searched_at_page(
             "foo".to_string(),
+            true,
             None,
             20,
             10,
@@ -1243,6 +1261,7 @@ mod tests {
         let mut searched_state = State::new();
         searched_state.to_searched(
             "foo".to_string(),
+            true,
             Some("cid".to_string()),
             0,
             Some(10),
@@ -1353,7 +1372,7 @@ mod tests {
         let write_opts = WriteOptions::default();
         let mut path = ".".to_string();
         let mut state = State::new();
-        state.to_searched("dummy".to_string(), None, 0, Some(0), false);
+        state.to_searched("dummy".to_string(), true, None, 0, Some(0), false);
 
         // next_col_offset is None initially
         let mut out_next = Vec::new();
@@ -1405,6 +1424,7 @@ mod tests {
         let mut state = State::new();
         state.to_searched_at_page(
             "ext:rs".to_string(),
+            true,
             None,
             0,
             5,

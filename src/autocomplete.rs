@@ -309,16 +309,29 @@ fn parse_edit_context(
     is_untag: bool,
 ) -> Option<CompletionContext> {
     let args_sub = &sub[arg_start..];
-    let quote_count = args_sub.chars().filter(|&c| c == '"').count();
-    let is_after_search_query = quote_count >= 2 && quote_count % 2 == 0;
-    if !is_after_search_query {
+    if !args_sub.starts_with('"') {
         return None;
     }
-
-    let last_quote_idx = sub.rfind('"')?;
+    let mut in_escape = false;
+    let mut close_quote = None;
+    for (i, c) in args_sub[1..].char_indices() {
+        if in_escape {
+            in_escape = false;
+            continue;
+        }
+        if c == '\\' {
+            in_escape = true;
+            continue;
+        }
+        if c == '"' {
+            close_quote = Some(arg_start + 1 + i);
+            break;
+        }
+    }
+    let close_idx = close_quote?;
     Some(parse_edit_args_context(
-        &sub[last_quote_idx + 1..],
-        last_quote_idx + 1,
+        &sub[close_idx + 1..],
+        close_idx + 1,
         pos,
         is_untag,
     ))
@@ -532,17 +545,17 @@ fn parse_token_query_context(
     }
 
     match prev {
-        Some(token) if token.ends_with(':') => {
-            CompletionContext::TypeWithSpace {
-                tag_type: unquote_prefix(&token[..token.len() - 1]).to_string(),
-                prefix: current.to_string(),
-                span,
-            }
-        }
         Some("&" | "|" | "-" | "-:" | "&:" | "(") | None => {
             CompletionContext::ExpressionStart {
                 prefix: current.to_string(),
                 is_outermost,
+                span,
+            }
+        }
+        Some(token) if token.ends_with(':') => {
+            CompletionContext::TypeWithSpace {
+                tag_type: unquote_prefix(&token[..token.len() - 1]).to_string(),
+                prefix: current.to_string(),
                 span,
             }
         }
@@ -661,11 +674,37 @@ pub fn sanitize_tag_type_for_path(tag_type: &str) -> Option<&str> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelMatchMode {
+    Prefix,
+    Substring,
+}
+
 pub fn fetch_tag_candidates(
     store: &Store,
     registry: &TagRegistry,
     tag_type: &str,
     prefix: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<String>> {
+    fetch_tag_candidates_with_mode(
+        store,
+        registry,
+        tag_type,
+        prefix,
+        LabelMatchMode::Prefix,
+        offset,
+        limit,
+    )
+}
+
+pub fn fetch_tag_candidates_with_mode(
+    store: &Store,
+    registry: &TagRegistry,
+    tag_type: &str,
+    prefix: &str,
+    mode: LabelMatchMode,
     offset: usize,
     limit: usize,
 ) -> Result<Vec<String>> {
@@ -679,7 +718,10 @@ pub fn fetch_tag_candidates(
         if !suggestions.is_empty() {
             return Ok(suggestions
                 .into_iter()
-                .filter(|s| s.starts_with(prefix))
+                .filter(|s| match mode {
+                    LabelMatchMode::Prefix => s.starts_with(prefix),
+                    LabelMatchMode::Substring => s.contains(prefix),
+                })
                 .skip(offset)
                 .take(limit)
                 .collect());
@@ -696,7 +738,7 @@ pub fn fetch_tag_candidates(
         );
     }
 
-    let query_str = definition_label_query(safe_type, prefix);
+    let query_str = definition_label_query_with_mode(safe_type, prefix, mode);
     let names =
         search_short_names(store, registry, &query_str, offset, Some(limit))?;
     Ok(names
@@ -800,6 +842,8 @@ pub fn fetch_allowed_edit_types(
                         edit.strategy(),
                         crate::tag::EditStrategy::Append
                             | crate::tag::EditStrategy::Replace
+                            | crate::tag::EditStrategy::Relocate
+                            | crate::tag::EditStrategy::SetFileAttr
                     )
                 }
             } else {
@@ -870,9 +914,13 @@ pub fn fetch_path_candidates(path_prefix: &str) -> Vec<String> {
     let (parent, file_prefix) =
         if path_prefix.ends_with('/') || path_prefix.ends_with('\\') {
             (p, "")
+        } else if matches!(expanded.as_str(), "." | "..") {
+            (std::path::Path::new("."), expanded.as_str())
         } else {
             (
-                p.parent().unwrap_or_else(|| std::path::Path::new(".")),
+                p.parent()
+                    .filter(|par| !par.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new(".")),
                 p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
             )
         };
@@ -983,11 +1031,28 @@ pub fn unescape_completion_prefix(raw: &str) -> String {
 }
 
 pub fn definition_label_query(tag_type: &str, prefix: &str) -> String {
-    format!(
-        "tag:\"{}:{}*\"",
-        escape_in_quote_glob(tag_type),
-        escape_in_quote_glob(&unescape_completion_prefix(prefix))
-    )
+    definition_label_query_with_mode(tag_type, prefix, LabelMatchMode::Prefix)
+}
+
+pub fn definition_label_query_with_mode(
+    tag_type: &str,
+    prefix: &str,
+    mode: LabelMatchMode,
+) -> String {
+    let escaped_type = escape_in_quote_glob(tag_type);
+    let escaped_prefix =
+        escape_in_quote_glob(&unescape_completion_prefix(prefix));
+    match mode {
+        LabelMatchMode::Prefix => {
+            format!("tag:\"{escaped_type}:{escaped_prefix}*\"")
+        }
+        LabelMatchMode::Substring if escaped_prefix.is_empty() => {
+            format!("tag:\"{escaped_type}:*\"")
+        }
+        LabelMatchMode::Substring => {
+            format!("tag:\"{escaped_type}:*{escaped_prefix}*\"")
+        }
+    }
 }
 
 pub fn definition_type_query(prefix: &str) -> String {
@@ -1058,6 +1123,30 @@ pub fn apply_smart_suffix(
     }
 }
 
+pub fn ghost_suffix_for_span<'a>(
+    line: &str,
+    pos: usize,
+    span: (usize, usize),
+    raw: &'a str,
+) -> Option<&'a str> {
+    let (start, end) = span;
+    if pos != end
+        || start > end
+        || end > line.len()
+        || !line.is_char_boundary(start)
+        || !line.is_char_boundary(end)
+    {
+        return None;
+    }
+    let typed = &line[start..end];
+    let suffix = raw.strip_prefix(typed)?;
+    if suffix.is_empty() {
+        None
+    } else {
+        Some(suffix)
+    }
+}
+
 pub fn unique_ghost_suffix(
     line: &str,
     pos: usize,
@@ -1066,24 +1155,29 @@ pub fn unique_ghost_suffix(
     let [only] = candidates else {
         return None;
     };
-    if pos != only.span.1 {
-        return None;
+    ghost_suffix_for_span(line, pos, only.span, &only.raw).map(str::to_string)
+}
+
+fn unify_candidate_quotes(
+    cands: &mut [Candidate],
+    in_quotes: bool,
+    mode: LabelMatchMode,
+) {
+    if in_quotes || mode != LabelMatchMode::Prefix || cands.len() <= 1 {
+        return;
     }
-    let start = only.span.0;
-    let end = only.span.1;
-    if start > end
-        || end > line.len()
-        || !line.is_char_boundary(start)
-        || !line.is_char_boundary(end)
-    {
-        return None;
+    let is_label = |c: &Candidate| {
+        matches!(c.kind, CandidateKind::Label | CandidateKind::Format)
+            && c.span.0 < c.span.1
+    };
+    if !cands.iter().any(|c| is_label(c) && c.raw.starts_with('"')) {
+        return;
     }
-    let typed = &line[start..end];
-    let suffix = only.raw.strip_prefix(typed)?;
-    if suffix.is_empty() {
-        None
-    } else {
-        Some(suffix.to_string())
+    for c in cands.iter_mut() {
+        if is_label(c) && !c.raw.starts_with('"') {
+            let trimmed = c.raw.strip_suffix(' ').unwrap_or(&c.raw);
+            c.raw = format!("\"{trimmed}\" ");
+        }
     }
 }
 
@@ -1092,10 +1186,11 @@ fn candidates_for_context(
     registry: &TagRegistry,
     ctx: CompletionContext,
     in_quotes: bool,
+    mode: LabelMatchMode,
     offset: usize,
     limit: usize,
 ) -> Vec<Candidate> {
-    match ctx {
+    let mut list = match ctx {
         CompletionContext::ExpressionStart {
             prefix,
             is_outermost,
@@ -1128,8 +1223,8 @@ fn candidates_for_context(
             prefix,
             span,
         } => {
-            let tags = fetch_tag_candidates(
-                store, registry, &tag_type, &prefix, offset, limit,
+            let tags = fetch_tag_candidates_with_mode(
+                store, registry, &tag_type, &prefix, mode, offset, limit,
             )
             .unwrap_or_default();
             let kind = if registry
@@ -1190,8 +1285,18 @@ fn candidates_for_context(
             ..
         } => {
             if has_colon {
-                let tags = fetch_tag_candidates(
-                    store, registry, &tag_type, &prefix, offset, limit,
+                if !is_untag
+                    && registry
+                        .get(&tag_type)
+                        .and_then(|f| f.edit())
+                        .is_some_and(|e| {
+                            e.strategy() == crate::tag::EditStrategy::Relocate
+                        })
+                {
+                    return vec![];
+                }
+                let tags = fetch_tag_candidates_with_mode(
+                    store, registry, &tag_type, &prefix, mode, offset, limit,
                 )
                 .unwrap_or_default();
                 let kind = if registry
@@ -1233,7 +1338,9 @@ fn candidates_for_context(
             }
         }
         CompletionContext::None => vec![],
-    }
+    };
+    unify_candidate_quotes(&mut list, in_quotes, mode);
+    list
 }
 
 pub fn resolve_completion_candidates(
@@ -1246,7 +1353,15 @@ pub fn resolve_completion_candidates(
 ) -> Vec<Candidate> {
     let ctx = parse_completion_context(line, pos);
     let in_quotes = is_inside_quotes(&line[..pos.min(line.len())]);
-    candidates_for_context(store, registry, ctx, in_quotes, offset, limit)
+    candidates_for_context(
+        store,
+        registry,
+        ctx,
+        in_quotes,
+        LabelMatchMode::Substring,
+        offset,
+        limit,
+    )
 }
 
 pub fn resolve_ttql_candidates(
@@ -1263,6 +1378,7 @@ pub fn resolve_ttql_candidates(
         registry,
         ctx,
         is_inside_quotes(ttql),
+        LabelMatchMode::Prefix,
         offset,
         limit,
     )
@@ -1583,6 +1699,34 @@ mod lexer_tests {
             matches!(ctx2, CompletionContext::TypeColon { tag_type, prefix, span } if tag_type == "extension" && prefix == "r" && span == (17, 18))
         );
     }
+
+    #[test]
+    fn test_parse_context_nest_operators_offer_expression_start() {
+        assert_eq!(
+            parse_completion_context("s extension:rs &: si", 20),
+            CompletionContext::ExpressionStart {
+                prefix: "si".to_string(),
+                is_outermost: true,
+                span: (18, 20),
+            }
+        );
+        assert_eq!(
+            parse_completion_context("s extension:rs -: si", 20),
+            CompletionContext::ExpressionStart {
+                prefix: "si".to_string(),
+                is_outermost: true,
+                span: (18, 20),
+            }
+        );
+    }
+
+    #[test]
+    fn test_fetch_path_candidates_relative_prefix_without_slash() {
+        let cands = fetch_path_candidates("sr");
+        assert!(cands.iter().any(|c| c == "src/"));
+        let dots = fetch_path_candidates("..");
+        assert!(dots.iter().all(|c| c != "src/"));
+    }
 }
 
 #[cfg(test)]
@@ -1894,11 +2038,14 @@ mod candidate_tests {
             setup_test_store_with_files(&["main.rs", "my file.txt"]);
         for ttql in ["ext", "extension:r", "filename:\"my", "count("] {
             let repl_line = format!("s {ttql}");
-            let repl: Vec<(String, usize)> = fetch_candidates(
+            let ctx = parse_completion_context(&repl_line, repl_line.len());
+            let in_quotes = is_inside_quotes(&repl_line);
+            let repl: Vec<(String, usize)> = candidates_for_context(
                 &store,
                 &reg,
-                &repl_line,
-                repl_line.len(),
+                ctx,
+                in_quotes,
+                LabelMatchMode::Prefix,
                 0,
                 50,
             )
@@ -1951,6 +2098,57 @@ mod candidate_tests {
             .collect();
             assert_eq!(repl, ttql_side, "{ttql}");
         }
+    }
+
+    #[test]
+    fn test_fetch_tag_candidates_with_mode_substring_matches_middle() {
+        let (_dir, store, reg) = setup_test_store_with_files(&[
+            "other/alpha.rs",
+            "other/beta.rs",
+            "lib/gamma.rs",
+        ]);
+        let mid = fetch_tag_candidates_with_mode(
+            &store,
+            &reg,
+            "path",
+            "alpha",
+            LabelMatchMode::Substring,
+            0,
+            10,
+        )
+        .unwrap();
+        assert!(mid.iter().any(|p| p.ends_with("alpha.rs")));
+
+        let fmt = fetch_tag_candidates_with_mode(
+            &store,
+            &reg,
+            "size",
+            "MB",
+            LabelMatchMode::Substring,
+            0,
+            10,
+        )
+        .unwrap();
+        assert!(fmt.iter().any(|s| s == "10.0MB"));
+    }
+
+    #[test]
+    fn test_unify_candidate_quotes_preserves_common_prefix() {
+        let mut list = vec![
+            Candidate {
+                raw: "aug.o ".to_string(),
+                span: (9, 11),
+                kind: CandidateKind::Label,
+            },
+            Candidate {
+                raw: "\"author\\=tanaka.txt\" ".to_string(),
+                span: (9, 11),
+                kind: CandidateKind::Label,
+            },
+        ];
+        unify_candidate_quotes(&mut list, false, LabelMatchMode::Prefix);
+        assert_eq!(list[0].raw, "\"aug.o\" ");
+        assert_eq!(list[1].raw, "\"author\\=tanaka.txt\" ");
     }
 }
 

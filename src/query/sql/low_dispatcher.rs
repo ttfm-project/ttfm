@@ -54,7 +54,9 @@ pub(super) fn try_dispatch_common(
             Ok(build_column_match_in_sql(src, *target_col, labels))
         }
         ResolvedNode::DefinitionRef { def, .. } => {
-            Ok(super::definition::build_definition_pick_sql(def, storage))
+            Ok(super::definition::build_registered_definition_pick_sql(
+                def, storage,
+            ))
         }
         ResolvedNode::Match {
             storage,

@@ -79,14 +79,8 @@ pub(crate) fn build_label_str_expr(tbl: Tbl) -> sea_query::SimpleExpr {
         .into()
 }
 
-/// rank の COALESCE 式を生成
-fn build_rank_expr() -> sea_query::SimpleExpr {
-    Func::cust(crate::db::DuckDbFunc::Coalesce)
-        .args([
-            Expr::col((Tbl::ItemReferences, Col::Rank)).into(),
-            Expr::val(0).into(),
-        ])
-        .into()
+fn carries_definitions(tbl: Tbl) -> bool {
+    matches!(tbl, Tbl::UserTags | Tbl::SystemTags)
 }
 
 /// Oneview のデータソースを識別するための型
@@ -137,17 +131,15 @@ fn spec_origin(source: &OneViewSource) -> sea_query::SimpleExpr {
 
 fn spec_rank(source: &OneViewSource) -> sea_query::SimpleExpr {
     match source {
-        OneViewSource::Tag(s) if s.table == Tbl::UserTags => build_rank_expr(),
-        OneViewSource::Tag(_) => Expr::val(0).into(),
         OneViewSource::ItemRef(_) => {
-            Func::cust(crate::db::DuckDbFunc::Coalesce)
-                .args([
-                    Expr::col((Tbl::ItemReferences, Col::Rank)).into(),
-                    Expr::val(0).into(),
-                ])
-                .into()
+            Expr::col((Tbl::ItemReferences, Col::Rank)).into()
         }
-        OneViewSource::Removed { .. } => Expr::val(0).into(),
+        OneViewSource::Tag(s) if carries_definitions(s.table) => {
+            Expr::col((Tbl::ItemReferences, Col::Rank)).into()
+        }
+        OneViewSource::Tag(_) | OneViewSource::Removed { .. } => {
+            crate::util::null_as(BiticalType::Integer)
+        }
     }
 }
 
@@ -330,7 +322,7 @@ fn build_tag_query(
 
     q.from_subquery(crate::util::parquet_query(&path_fn(source.target)), tbl);
 
-    if tbl == Tbl::UserTags {
+    if carries_definitions(tbl) {
         q.join_subquery(
             sea_query::JoinType::LeftJoin,
             crate::util::parquet_query(&path_fn(TargetTable::ItemReferences)),
@@ -424,7 +416,7 @@ fn resolved_sources_sql(
     let file: &str = ItemKind::File.into();
     format!(
         "SELECT \"u\".* REPLACE(\
-           coalesce(\"user_rank\".\"rank\", \"u\".\"rank\") AS \"rank\", \
+           coalesce(\"u\".\"rank\", \"user_rank\".\"rank\", 0) AS \"rank\", \
            (CASE WHEN \"u\".\"item_kind\" = '{volatile}' \
                   AND \"rf\".\"item_id\" IS NOT NULL \
                  THEN '{file}' ELSE \"u\".\"item_kind\" END) AS \"item_kind\") \

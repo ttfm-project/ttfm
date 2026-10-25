@@ -140,6 +140,7 @@ fn walk(
             Rule::quoted_string
             | Rule::unquoted_string
             | Rule::unquoted_tag_string
+            | Rule::item_id_literal
             | Rule::number => {
                 units.push(Unit::Label(build_pattern(pair, next)?));
             }

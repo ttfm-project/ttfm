@@ -70,6 +70,10 @@ impl ItemId {
         matches!(self, ItemId::Settling(_, _))
     }
 
+    pub fn is_file(&self) -> bool {
+        matches!(self, ItemId::Stored(id) if Origin::within(*id) == Origin::File)
+    }
+
     /// Volatile を、区画（Origin）だけ確定した Settling に変換します。
     /// counter は使い回し、新規採番はしません。
     pub fn settle(self, origin: Origin) -> Self {
@@ -701,6 +705,10 @@ impl TagType {
     pub fn is_base_key(&self) -> bool {
         crate::util::is_full_match_glob(self.as_str())
     }
+
+    pub(crate) fn is_bare_glob(&self, pattern: &str) -> bool {
+        self.as_str() == pattern
+    }
 }
 
 impl std::fmt::Display for TagType {
@@ -1292,6 +1300,10 @@ impl Label {
     pub fn value(&self) -> Bitical {
         self.value.clone()
     }
+
+    pub(crate) fn is_bare_glob(&self, pattern: &str) -> bool {
+        self.as_str() == pattern
+    }
 }
 
 impl From<String> for Label {
@@ -1381,6 +1393,10 @@ impl TypedTag {
 
     pub fn is_default_node(&self) -> bool {
         matches!(self.node, TypedTagNode::DefaultTypedTag)
+    }
+
+    pub(crate) fn is_all_items_wildcard(&self) -> bool {
+        self.tag_type().is_bare_glob("*") && self.label.is_bare_glob("*")
     }
 
     /// 名札が指す既定形（`Type: := Label` の比較）。

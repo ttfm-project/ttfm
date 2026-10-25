@@ -162,39 +162,30 @@ fn precompute_agg_into(
     let inner = agg.inner_node();
     let key = inner as *const ResolvedNode as usize;
 
-    // rest は split のたびに新しく合成されるノードでポインタが安定しないため、
-    // rest 自身ではなく inner のポインタ（key）に登録する。
     if matches!(agg, ResolvedAggregationNode::Count(_)) {
         if inner.is_pure_definition() {
             if !ctx.definition_counts.contains_key(&key)
                 && !ctx.definition_count_nodes.contains_key(&key)
             {
-                ctx.definition_count_nodes.insert(key, vec![inner.clone()]);
+                ctx.definition_count_nodes
+                    .insert(key, inner.definition_branches(false));
             }
             return;
         }
-        if let Some((defs, rest)) = inner.split_definition_branches() {
-            if !ctx.definition_counts.contains_key(&key)
-                && !ctx.definition_count_nodes.contains_key(&key)
-            {
-                ctx.definition_count_nodes
-                    .insert(key, defs.into_iter().cloned().collect());
-            }
-            if let Some(rest_node) = rest {
-                if !ctx.agg_filters.contains_key(&key)
-                    && !ctx.filter_nodes.contains_key(&key)
-                {
-                    ctx.filter_nodes.insert(key, rest_node);
-                }
-            }
-            return;
+        let branches = inner.definition_branches(true);
+        if !branches.is_empty()
+            && !ctx.definition_counts.contains_key(&key)
+            && !ctx.definition_count_nodes.contains_key(&key)
+        {
+            ctx.definition_count_nodes.insert(key, branches);
         }
     }
 
     if !ctx.agg_filters.contains_key(&key)
         && !ctx.filter_nodes.contains_key(&key)
     {
-        let (_, filter_opt, _) = inner.extract_agg_parts();
+        let (_, filter_opt, _) =
+            inner.without_unregistered_definitions().extract_agg_parts();
         if let Some(filter) = filter_opt {
             ctx.filter_nodes.insert(key, filter);
         }
@@ -204,9 +195,10 @@ fn precompute_agg_into(
         && !ctx.agg_inner_sqls.contains_key(&key)
         && !ctx.inner_nodes.contains_key(&key)
     {
-        let (_, inner_tag_type) = resolve_count_target(inner);
+        let items = inner.without_unregistered_definitions();
+        let (_, inner_tag_type) = resolve_count_target(&items);
         if inner_tag_type.is_none() {
-            ctx.inner_nodes.insert(key, inner.clone());
+            ctx.inner_nodes.insert(key, items.into_owned());
         }
     }
 }
@@ -326,11 +318,9 @@ fn materialize_agg_context(
         ctx.agg_inner_sqls
             .insert(key, build_filter_sql(src, &node, storage));
     }
-    let definition_count_nodes: Vec<(usize, Vec<ResolvedNode>)> =
-        ctx.definition_count_nodes.drain().collect();
-    for (key, defs) in definition_count_nodes {
+    for (key, branches) in ctx.definition_count_nodes.drain() {
         let sql =
-            crate::query::lens_builder::count_definitions(src, &defs, storage);
+            crate::query::lens_builder::count_definitions(&branches, storage);
         ctx.definition_counts.insert(key, sql);
     }
 }

@@ -476,7 +476,7 @@ fn test_quit_to_init_restores_default_query_ghost() {
 
     let (store, registry, _dir, _root) = setup_env(&["a.txt"]);
     let mut state = State::new();
-    state.to_searched("extension:txt".into(), None, 1, None, false);
+    state.to_searched("extension:txt".into(), true, None, 1, None, false);
     let hinter = Arc::new(Mutex::new(InteractiveHinter::new()));
     hinter.lock().unwrap().set_last_query("extension:txt");
 
@@ -507,7 +507,7 @@ fn test_quit_to_init_restores_default_query_ghost() {
     sync_hinter_last_query(&hinter, state.last_query(), DEFAULT_QUERY);
     assert_eq!(hinter.lock().unwrap().handle_line("s", 1), " *:*");
 
-    state.to_searched("extension:txt".into(), None, 1, None, false);
+    state.to_searched("extension:txt".into(), true, None, 1, None, false);
     hinter.lock().unwrap().set_last_query("extension:txt");
     let cmd = parse_command("q", true).unwrap();
     dispatch_command(
@@ -593,4 +593,60 @@ fn test_interactive_searched_dynamic_hints_and_no_examples() {
     assert!(out_str.contains("n \x1b[2mnext\x1b[0m"));
     assert!(out_str.contains("p \x1b[2mprev\x1b[0m"));
     assert!(out_str.contains("h \x1b[2mhelp\x1b[0m"));
+}
+
+#[test]
+fn test_interactive_untag_hint_skips_non_item_query() {
+    use std::sync::{Arc, Mutex};
+    use ttfm::cli::interactive::autocomplete::{
+        InteractiveHinter, DEFAULT_QUERY,
+    };
+    use ttfm::cli::interactive::command::{dispatch_command, Command};
+    use ttfm::cli::interactive::runner::sync_hinter_state;
+    use ttfm::cli::interactive::state::State;
+
+    let (store, registry, _dir, _root) = setup_env(&["notes.md"]);
+    ttfm::edit::edit(
+        &store,
+        &registry,
+        "filename:notes.md",
+        Some("project:cx2"),
+        ttfm::edit::QueryType::Tag,
+        None,
+        WriteOptions::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let hinter = Arc::new(Mutex::new(InteractiveHinter::new()));
+    let mut state = State::new();
+    let search = |state: &mut State, q: &str| {
+        dispatch_command(
+            Command::Search(q.to_string()),
+            state,
+            &store,
+            &registry,
+            &Config::default(),
+            WriteOptions::default(),
+            &mut ".".to_string(),
+            &mut Cursor::new(b""),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    };
+
+    search(&mut state, "filename:notes.md & project:");
+    sync_hinter_state(&hinter, &state, DEFAULT_QUERY);
+    assert_eq!(hinter.lock().unwrap().handle_line("u", 1), "");
+    assert_eq!(
+        hinter.lock().unwrap().handle_line("t", 1),
+        " \"filename:notes.md & project:\" "
+    );
+
+    search(&mut state, "filename:notes.md");
+    sync_hinter_state(&hinter, &state, DEFAULT_QUERY);
+    assert_eq!(
+        hinter.lock().unwrap().handle_line("u", 1),
+        " \"filename:notes.md\" "
+    );
 }

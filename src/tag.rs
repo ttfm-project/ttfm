@@ -19,6 +19,7 @@ use crate::db::{BiticalType, TargetTable};
 use crate::query::ast::{
     BasicOp, ComparisonNode, ComparisonOp, Operand, QueryNode,
 };
+use crate::query::format::OperandFormat;
 use crate::query::lens_resolver::ResolvedNode;
 use crate::response::Item;
 use crate::types::{
@@ -497,12 +498,47 @@ pub trait Edit: Send + Sync {
             }
         }
     }
-    fn validate(&self, new: &Label) -> Result<Label> {
-        Ok(new.clone())
+    fn validate(&self, raw: &str, quoted: bool) -> Result<Label> {
+        label_from_raw(raw, quoted)
     }
     fn inject(&self, _item: &Item) -> Option<Label> {
         None
     }
+}
+
+fn label_from_raw(raw: &str, quoted: bool) -> Result<Label> {
+    if quoted {
+        return Label::other(Bitical::String(raw.to_string())).to_ok();
+    }
+    match Bitical::parse(raw) {
+        Some(Ok(b)) => {
+            crate::query::format::attach_formatted_node(Label::other(b)).to_ok()
+        }
+        Some(Err(e)) => bail!("invalid value {raw:?}: {e}"),
+        None => bail!("invalid value {raw:?}"),
+    }
+}
+
+pub(crate) fn type_cannot_assign(
+    tag_type: &TagType,
+    expected: BiticalType,
+    raw: &str,
+) -> anyhow::Error {
+    let article = match expected {
+        BiticalType::Integer => "an",
+        _ => "a",
+    };
+    anyhow::anyhow!(
+        concat!(
+            "type '{}' is {}, cannot assign \"{}\". ",
+            "Please enter {article} {} or change type definition."
+        ),
+        tag_type,
+        expected,
+        raw,
+        expected,
+        article = article,
+    )
 }
 
 // ============================================================
@@ -559,6 +595,17 @@ pub struct TypeConfig {
     pub is_explicit: bool,
 }
 
+impl TypeConfig {
+    pub const fn new() -> Self {
+        Self {
+            display_unit: None,
+            strategy: None,
+            bitical_type: None,
+            is_explicit: false,
+        }
+    }
+}
+
 /// タグ型の個別設定（TypeConfig）を保持するインメモリレジストリ。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TypeRegistry {
@@ -586,6 +633,43 @@ impl TypeRegistry {
         &self,
     ) -> impl Iterator<Item = (&crate::types::TagType, &TypeConfig)> {
         self.types.iter()
+    }
+}
+
+pub struct UserTypeEdit {
+    pub tag_type: TagType,
+    pub config: TypeConfig,
+}
+
+impl Edit for UserTypeEdit {
+    fn strategy(&self) -> EditStrategy {
+        self.config.strategy.unwrap_or(EditStrategy::Append)
+    }
+
+    fn validate(&self, raw: &str, quoted: bool) -> Result<Label> {
+        if let Some(bt) = self.config.bitical_type {
+            match Bitical::parse_as(raw, bt) {
+                Some(b) => Label::other(b).to_ok(),
+                None => Err(type_cannot_assign(&self.tag_type, bt, raw)),
+            }
+        } else {
+            label_from_raw(raw, quoted)
+        }
+    }
+}
+
+pub enum EditRef<'a> {
+    Builtin(&'a dyn Edit),
+    User(UserTypeEdit),
+}
+
+impl<'a> std::ops::Deref for EditRef<'a> {
+    type Target = dyn Edit + 'a;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Builtin(e) => *e,
+            Self::User(e) => e,
+        }
     }
 }
 
@@ -650,6 +734,25 @@ impl TagRegistry {
 
     pub fn type_configs(&self) -> TypeRegistry {
         self.type_configs.read().unwrap().clone()
+    }
+
+    pub fn edit_of(&self, tag_type: &TagType) -> Result<EditRef<'_>> {
+        if let Some(f) = self.get(tag_type.as_str()) {
+            if let Some(e) = f.edit() {
+                Ok(EditRef::Builtin(e))
+            } else {
+                bail!(
+                    "tag type '{tag_type}' is registered but not editable (Forbidden)"
+                );
+            }
+        } else {
+            let cfg =
+                self.type_config(tag_type).unwrap_or_else(TypeConfig::new);
+            Ok(EditRef::User(UserTypeEdit {
+                tag_type: tag_type.clone(),
+                config: cfg,
+            }))
+        }
     }
 
     #[cfg(test)]
@@ -1023,6 +1126,16 @@ impl Edit for FilenameFn {
     fn path_components(&self) -> &'static [SType] {
         &[SType::Stem, SType::Extension]
     }
+    fn validate(&self, raw: &str, _quoted: bool) -> Result<Label> {
+        if raw.is_empty()
+            || raw == "."
+            || raw == ".."
+            || raw.chars().any(std::path::is_separator)
+        {
+            bail!("filename cannot contain path separator or parent reference");
+        }
+        Label::other(Bitical::String(raw.to_string())).to_ok()
+    }
 }
 impl Index for FilenameFn {
     fn role(&self) -> ScanRole {
@@ -1094,6 +1207,12 @@ impl Edit for ExtensionFn {
     }
     fn path_components(&self) -> &'static [SType] {
         &[SType::Extension]
+    }
+    fn validate(&self, raw: &str, _quoted: bool) -> Result<Label> {
+        if raw.is_empty() || raw.chars().any(std::path::is_separator) {
+            bail!("extension cannot contain path separator");
+        }
+        Label::other(Bitical::String(raw.to_string())).to_ok()
     }
 }
 impl Index for ExtensionFn {
@@ -1285,6 +1404,16 @@ impl Edit for StemFn {
     }
     fn path_components(&self) -> &'static [SType] {
         &[SType::Stem]
+    }
+    fn validate(&self, raw: &str, _quoted: bool) -> Result<Label> {
+        if raw.is_empty()
+            || raw == "."
+            || raw == ".."
+            || raw.chars().any(std::path::is_separator)
+        {
+            bail!("stem cannot contain path separator or parent reference");
+        }
+        Label::other(Bitical::String(raw.to_string())).to_ok()
     }
 }
 impl Index for StemFn {
@@ -2089,13 +2218,27 @@ impl Edit for ItemKindFn {
         EditStrategy::ModifyInjection
     }
     fn inject(&self, item: &Item) -> Option<Label> {
-        let kind = match item.representative.tags.as_slice() {
-            [l] if l.tag_type() == TagType::Base(SType::TypedTag) => {
-                ItemKind::Tag
+        let from_type_tag = item.tags.entries.iter().find_map(|e| {
+            if e.typed_tag.tag_type() != TagType::Base(SType::Type) {
+                return None;
             }
-            [l] if l.tag_type() == TagType::Base(SType::Type) => ItemKind::Type,
-            _ => ItemKind::Note,
-        };
+            match e.typed_tag.as_str().as_str() {
+                "tag" => Some(ItemKind::Tag),
+                "type" => Some(ItemKind::Type),
+                _ => None,
+            }
+        });
+        let kind = from_type_tag.unwrap_or(
+            match item.representative.tags.as_slice() {
+                [l] if l.tag_type() == TagType::Base(SType::TypedTag) => {
+                    ItemKind::Tag
+                }
+                [l] if l.tag_type() == TagType::Base(SType::Type) => {
+                    ItemKind::Type
+                }
+                _ => ItemKind::Note,
+            },
+        );
         Some(Label::from(kind))
     }
 }
@@ -2137,6 +2280,12 @@ impl TagFunction for RankFn {
 impl Edit for RankFn {
     fn strategy(&self) -> EditStrategy {
         EditStrategy::Replace
+    }
+    fn validate(&self, raw: &str, _quoted: bool) -> Result<Label> {
+        let n: i64 = raw.parse().map_err(|_| {
+            crate::query::error::tag_value_not_interpretable("rank", raw)
+        })?;
+        Label::other(Bitical::Integer(n)).to_ok()
     }
 }
 impl Query for RankFn {

@@ -218,6 +218,13 @@ macro_rules! define_operand_formats {
                     $( Formatted::$name(v) => <$name as OperandFormat>::as_bitical(v), )+
                 }
             }
+
+            pub fn representative_type(&self) -> $crate::types::SType {
+                use $crate::query::format::OperandFormat;
+                match self {
+                    $( Formatted::$name(v) => <$name as OperandFormat>::representative_type(v), )+
+                }
+            }
         }
     };
 }

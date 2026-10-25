@@ -262,9 +262,8 @@ fn test_definition_ref_rank_falls_back_to_registry_default() {
         .unwrap();
     std::fs::rename(&tmp, &path).unwrap();
 
-    // `type:filename` は DefinitionRef。未登録なので COALESCE のデフォルト値が使われる。
-    // registry の default_rank (SystemRank::FILENAME) にフォールバックすべきで、
-    // ハードコードされた 0 になってはいけない。
+    // `type:filename` は DefinitionRef。未登録なので registry の default_rank から
+    // 20 引いた値になる。ハードコードされた 0 から 20 引いただけになってはいけない。
     let expected = ttfm::rank::get_rank_by_name(&registry, "filename");
     assert_ne!(
         expected, 0,
@@ -280,8 +279,8 @@ fn test_definition_ref_rank_falls_back_to_registry_default() {
     .unwrap();
     assert_eq!(results.results.len(), 1);
     assert_eq!(
-        results.results[0].rank, expected,
-        "DefinitionRef rank fallback should use the registry's default_rank ({}), not the hardcoded COALESCE default of 0",
-        expected
+        results.results[0].rank,
+        expected - 20,
+        "unregistered DefinitionRef rank is the registry default_rank ({expected}) minus 20, not the COALESCE default of 0"
     );
 }

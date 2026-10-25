@@ -593,26 +593,31 @@ fn check_label_op_misuse(
     line_str: &str,
     col: usize,
 ) -> Option<String> {
-    // col points to ':' (1-indexed). line_str.chars().nth(col-1) is ':'
-    let label_op_char = line_str.chars().nth(col).unwrap_or(' ');
-    if !is_scalar_op_char(label_op_char) {
-        return None;
-    }
-
-    let full_op = format!(":{}", label_op_char);
+    let op_rest: String = line_str.chars().skip(col).collect();
+    let label_op = ["^=", "<=", ">=", "^", ">", "<", "="]
+        .into_iter()
+        .find(|op| op_rest.starts_with(op))?;
+    let full_op = format!(":{label_op}");
 
     // lhs is from start of line until just before the ':' (col - 1 chars)
     let lhs = line_str.chars().take(col - 1).collect::<String>();
-    // rhs starts after the ':' and the operator character (skip(col + 1))
-    let rhs = line_str.chars().skip(col + 1).collect::<String>();
+    let rhs = line_str
+        .chars()
+        .skip(col + label_op.len())
+        .collect::<String>();
 
     // Check LHS type
     let lhs_token = tokens.last()?;
+
+    let is_typed_tag = !lhs_token.starts_with(['"', '\''])
+        && lhs_token.find(':').is_some_and(|i| i > 0);
 
     let object_type = if lhs_token.ends_with(')') {
         "Aggregation/Calculation"
     } else if lhs_token.ends_with(':') {
         "Projection"
+    } else if is_typed_tag {
+        "TypedTag"
     } else {
         "Scalar/Value"
     };
@@ -632,6 +637,26 @@ fn check_label_op_misuse(
             full_op,
             rhs
         ))
+    } else if object_type == "TypedTag" {
+        let rhs = rhs.trim();
+        let value = rhs
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(['"', '\'']);
+        let projection = crate::types::Bitical::String(value.to_string())
+            .to_formatted()
+            .representative_type();
+        Some(format!(
+            "Invalid operator '{}': Label Comparison cannot be applied to {} ('{}'). \nDid you mean: '{} & {}: {} {}'",
+            full_op,
+            object_type,
+            lhs_token,
+            lhs_token,
+            projection,
+            full_op,
+            rhs
+        ))
     } else {
         // Standard message with specific suggestion
         Some(format!(
@@ -640,7 +665,7 @@ fn check_label_op_misuse(
             object_type,
             lhs_token,
             lhs_token,
-            label_op_char,
+            label_op,
             rhs.trim()
         ))
     }

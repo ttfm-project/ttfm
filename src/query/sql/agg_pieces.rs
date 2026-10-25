@@ -102,20 +102,16 @@ fn lookup_definition_count_expr(
     )
 }
 
-/// 定義枝 distinct 件数と rest（定義以外の枝）の count_distinct を合算した式。
-/// rest が None なら定義枝件数のみ。
+/// 定義枝 distinct 件数とアイテム側の count_distinct を合算した式。
 fn definition_count_expr(
-    rest: Option<&ResolvedNode>,
+    items: &ResolvedNode,
     key: usize,
     agg_ctx: &AggregationContext,
 ) -> SimpleExpr {
     let definition_expr = lookup_definition_count_expr(key, agg_ctx);
-    let Some(rest_node) = rest else {
-        return definition_expr;
-    };
-    let rest_expr = resolve_agg_base_expr(rest_node, Col::ItemId, key, agg_ctx);
+    let items_expr = resolve_agg_base_expr(items, Col::ItemId, key, agg_ctx);
     Expr::expr(definition_expr)
-        .binary(BinOper::Add, Expr::expr(rest_expr).count_distinct())
+        .binary(BinOper::Add, Expr::expr(items_expr).count_distinct())
 }
 
 /// Count(inner) の SimpleExpr を構築する。定義枝（DefinitionRef、Or 経由も含む）を
@@ -128,8 +124,12 @@ fn build_count_expr(
     if inner.is_pure_definition() {
         return lookup_definition_count_expr(key, agg_ctx);
     }
-    if let Some((_, rest)) = inner.split_definition_branches() {
-        return definition_count_expr(rest.as_ref(), key, agg_ctx);
+    if inner.has_definition_branch() {
+        return definition_count_expr(
+            &inner.without_unregistered_definitions(),
+            key,
+            agg_ctx,
+        );
     }
     let base_expr = resolve_agg_base_expr(inner, Col::ItemId, key, agg_ctx);
     Expr::expr(base_expr).count_distinct().into()
@@ -519,14 +519,12 @@ pub(super) fn collect_tag_types_from_operand(
 
 // ── nvalue SQL ─────────────────────────────────────────────────────────────
 
-/// Nest 文脈での Count(inner) が定義枝を含む場合の nvalue SQL。定義枝 distinct
-/// 件数は group に依存しない定数として各 group に加算され、rest（それ以外の枝）が
-/// あればその実アイテム数を group ごとに数えて加算する。
+/// Nest 文脈での Count(inner) が純定義の場合の nvalue SQL。定義枝 distinct
+/// 件数は group に依存しない定数として各 group に付く。
 fn build_definition_count_nvalue_sql(
     src: &Src,
     proj_operand: &ResolvedOperand,
     key: usize,
-    rest: Option<&ResolvedNode>,
     context: Option<&ResolvedNode>,
     item_scope: Option<SelectStatement>,
     include_item_id: bool,
@@ -540,7 +538,7 @@ fn build_definition_count_nvalue_sql(
     };
     let mut stmt = Query::select();
     stmt.expr_as(CustomFunc::as_representative(group_expr), Group);
-    stmt.expr_as(definition_count_expr(rest, key, agg_ctx), Nvalue);
+    stmt.expr_as(lookup_definition_count_expr(key, agg_ctx), Nvalue);
     stmt.from(src);
     if let Some(tt) = &proj_tag_type {
         stmt.and_where(Expr::col(Col::Type).eq(tt.as_str()));
@@ -597,7 +595,6 @@ pub(super) fn build_count_nvalue_sql(
             src,
             proj_operand,
             key,
-            None,
             context,
             item_scope,
             include_item_id,
@@ -605,21 +602,8 @@ pub(super) fn build_count_nvalue_sql(
             nest_ctx,
         );
     }
-    if let Some((_, rest)) = inner.split_definition_branches() {
-        let key = inner as *const ResolvedNode as usize;
-        return build_definition_count_nvalue_sql(
-            src,
-            proj_operand,
-            key,
-            rest.as_ref(),
-            context,
-            item_scope,
-            include_item_id,
-            agg_ctx,
-            nest_ctx,
-        );
-    }
-    let (count_col, inner_tag_type) = resolve_count_target(inner);
+    let items = inner.without_unregistered_definitions();
+    let (count_col, inner_tag_type) = resolve_count_target(&items);
     let mut stmt = Query::select();
 
     if let Some(tag_type) = inner_tag_type {
@@ -654,7 +638,7 @@ pub(super) fn build_count_nvalue_sql(
         if let Some(scope) = item_scope {
             stmt.and_where(Expr::col((Proj, Col::ItemId)).in_subquery(scope));
         }
-        let (_storage, inner_filter, _operand) = inner.extract_agg_parts();
+        let (_storage, inner_filter, _operand) = items.extract_agg_parts();
         if inner_filter.is_some() {
             let inner_ptr = inner as *const ResolvedNode as usize;
             let filter_pick = agg_ctx
@@ -1164,20 +1148,16 @@ fn build_count_stmt(
         let definition_expr = lookup_definition_count_expr(key, agg_ctx);
         return Query::select().expr_as(definition_expr, Scalar).to_owned();
     }
-    let Some((_, rest)) = inner.split_definition_branches() else {
+    if !inner.has_definition_branch() {
         return build_count_stmt_inner(src, inner, key, None, agg_ctx);
-    };
-    let definition_expr = lookup_definition_count_expr(key, agg_ctx);
-    match rest {
-        None => Query::select().expr_as(definition_expr, Scalar).to_owned(),
-        Some(rest_node) => build_count_stmt_inner(
-            src,
-            &rest_node,
-            key,
-            Some(definition_expr),
-            agg_ctx,
-        ),
     }
+    build_count_stmt_inner(
+        src,
+        &inner.without_unregistered_definitions(),
+        key,
+        Some(lookup_definition_count_expr(key, agg_ctx)),
+        agg_ctx,
+    )
 }
 
 fn build_agg_inner(

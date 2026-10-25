@@ -524,6 +524,7 @@ fn build_operand(
         Rule::label
         | Rule::number
         | Rule::quoted_string
+        | Rule::item_id_literal
         | Rule::unquoted_string
         | Rule::unquoted_tag_string => {
             Ok(Operand::Literal(build_label(inner)?))
@@ -782,6 +783,7 @@ fn build_operand_calc(
         Rule::label
         | Rule::number
         | Rule::quoted_string
+        | Rule::item_id_literal
         | Rule::unquoted_string
         | Rule::unquoted_tag_string => {
             Ok(Operand::Literal(build_label(inner)?))
@@ -857,7 +859,9 @@ fn build_label(pair: Pair<Rule>) -> Result<Label> {
             let i = inner.as_str().parse::<i64>()?;
             Ok(crate::query::format::attach_formatted_node(Label::from(i)))
         }
-        Rule::unquoted_string | Rule::unquoted_tag_string => {
+        Rule::unquoted_string
+        | Rule::unquoted_tag_string
+        | Rule::item_id_literal => {
             let s = unescape_glob_string(inner.as_str())?;
             Ok(crate::query::format::attach_formatted_node(Label::from(s)))
         }
@@ -1026,6 +1030,24 @@ fn build_arithmetic_operand(
 mod tests {
     use super::*;
     use crate::query::ast::{ComparisonOp, QueryNode};
+
+    #[test]
+    fn test_item_id_literal_accepts_every_origin_short() {
+        use strum::IntoEnumIterator;
+        for origin in crate::types::Origin::iter() {
+            for offset in ["0", "12", "*"] {
+                let text = format!("{}({offset})", origin.short());
+                let pair = PestQueryParser::parse(Rule::item_id_literal, &text)
+                    .unwrap()
+                    .next()
+                    .unwrap();
+                assert_eq!(pair.as_str(), text);
+            }
+        }
+        assert!(
+            PestQueryParser::parse(Rule::item_id_literal, "sum(1)").is_err()
+        );
+    }
 
     #[test]
     fn test_literal_first_size_comparison_interprets_unit_string() {

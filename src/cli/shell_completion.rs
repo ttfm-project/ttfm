@@ -15,11 +15,21 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use clap::CommandFactory;
+
 use crate::autocomplete::{resolve_ttql_candidates, TtqlRole};
 use crate::db::Store;
 use crate::tag::TagRegistry;
 
 pub const BASH_DEFAULT_WORDBREAKS: &str = " \t\n\"'><=;|&(:";
+pub const DEFAULT_SHELL_COMPLETION_LIMIT: usize = 40;
+pub const EXIT_SHELL_FALLBACK: i32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellCompletionOutcome {
+    Completed(Vec<String>),
+    Fallback,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellQuote {
@@ -239,6 +249,174 @@ impl ShellKind {
     }
 }
 
+fn clap_metadata() -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut cmd = crate::cli::args::Cli::command();
+    cmd.build();
+    let subcommands: Vec<String> = cmd
+        .get_subcommands()
+        .filter(|s| !s.is_hide_set())
+        .map(|s| s.get_name().to_string())
+        .collect();
+    let mut global_opts = Vec::new();
+    let mut global_val_opts = Vec::new();
+    for a in cmd.get_arguments() {
+        if a.is_positional() {
+            continue;
+        }
+        let takes_val = a.get_action().takes_values()
+            && a.get_num_args().map_or(true, |r| r.min_values() > 0);
+        let mut names = Vec::new();
+        if let Some(l) = a.get_long() {
+            names.push(format!("--{l}"));
+        }
+        if let Some(s) = a.get_short() {
+            names.push(format!("-{s}"));
+        }
+        for n in names {
+            if takes_val {
+                global_val_opts.push(n.clone());
+            }
+            global_opts.push(n);
+        }
+    }
+    (subcommands, global_opts, global_val_opts)
+}
+
+fn clap_subcommand_opts(subcommand: &str) -> (Vec<String>, Vec<String>) {
+    let mut cmd = crate::cli::args::Cli::command();
+    cmd.build();
+    let Some(sub) = cmd.find_subcommand(subcommand) else {
+        return (vec![], vec![]);
+    };
+    let mut opts = Vec::new();
+    let mut val_opts = Vec::new();
+    for a in sub.get_arguments() {
+        if a.is_positional() {
+            continue;
+        }
+        let takes_val = a.get_action().takes_values()
+            && a.get_num_args().map_or(true, |r| r.min_values() > 0);
+        let mut names = Vec::new();
+        if let Some(l) = a.get_long() {
+            names.push(format!("--{l}"));
+        }
+        if let Some(s) = a.get_short() {
+            names.push(format!("-{s}"));
+        }
+        for n in names {
+            if takes_val {
+                val_opts.push(n.clone());
+            }
+            opts.push(n);
+        }
+    }
+    (opts, val_opts)
+}
+
+fn resolve_point_byte(line: &str, point: usize) -> usize {
+    line.char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(line.len()))
+        .nth(point)
+        .unwrap_or_else(|| {
+            if line.is_char_boundary(point) {
+                point
+            } else {
+                line.len()
+            }
+        })
+}
+
+fn format_shell_replacements(
+    word: &CurrentWord,
+    replacements: Vec<String>,
+    shell: ShellKind,
+) -> Vec<String> {
+    match shell {
+        ShellKind::Zsh | ShellKind::Fish => replacements
+            .into_iter()
+            .filter(|r| !r.chars().any(char::is_control))
+            .collect(),
+        ShellKind::Bash => bash_replies(word, &replacements),
+    }
+}
+
+pub fn cli_structural_candidates_from_parsed(
+    parsed: &ShellLine,
+    shell: ShellKind,
+    offset: usize,
+    limit: usize,
+) -> Option<Vec<String>> {
+    if parsed.current.quote != ShellQuote::None
+        || parsed.args.iter().any(|a| a == "--")
+    {
+        return None;
+    }
+    let (subcommands, global_opts, global_val_opts) = clap_metadata();
+    let val_refs: Vec<&str> =
+        global_val_opts.iter().map(AsRef::as_ref).collect();
+    let top = positionals(parsed.args.get(1..)?, &val_refs)?;
+    let prefix = parsed.current.text.as_str();
+    let pool: Vec<String> =
+        match (top.first().copied(), prefix.starts_with('-')) {
+            (None, true) => global_opts
+                .into_iter()
+                .filter(|o| o.starts_with(prefix))
+                .collect(),
+            (None, false) => subcommands
+                .into_iter()
+                .filter(|s| s.starts_with(prefix))
+                .collect(),
+            (Some(sub), true) => {
+                let (sub_opts, _) = clap_subcommand_opts(sub);
+                sub_opts
+                    .into_iter()
+                    .filter(|o| o.starts_with(prefix))
+                    .collect()
+            }
+            (Some(_), false) => return None,
+        };
+    let mut page: Vec<String> =
+        pool.iter().skip(offset).take(limit).cloned().collect();
+    if page.is_empty() && offset > 0 {
+        page = pool.iter().take(limit).cloned().collect();
+    }
+    Some(format_shell_replacements(&parsed.current, page, shell))
+}
+
+pub fn evaluate_shell_completion(
+    store_and_reg: Option<(&Store, &TagRegistry)>,
+    line: &str,
+    point: usize,
+    wordbreaks: &str,
+    shell: ShellKind,
+    offset: usize,
+    limit: usize,
+) -> ShellCompletionOutcome {
+    let point_byte = resolve_point_byte(line, point);
+    let Some(head) = line.get(..point_byte) else {
+        return ShellCompletionOutcome::Fallback;
+    };
+    let Some(parsed) = lex_shell_line(head, wordbreaks) else {
+        return ShellCompletionOutcome::Fallback;
+    };
+    if let Some(cands) =
+        cli_structural_candidates_from_parsed(&parsed, shell, offset, limit)
+    {
+        return ShellCompletionOutcome::Completed(cands);
+    }
+    let Some(_role) = query_arg_role(&parsed.args) else {
+        return ShellCompletionOutcome::Fallback;
+    };
+    let Some((store, registry)) = store_and_reg else {
+        return ShellCompletionOutcome::Completed(vec![]);
+    };
+    let cands = shell_candidates(
+        store, registry, line, point, wordbreaks, shell, offset, limit,
+    );
+    ShellCompletionOutcome::Completed(cands)
+}
+
 pub fn shell_candidates(
     store: &Store,
     registry: &TagRegistry,
@@ -249,18 +427,7 @@ pub fn shell_candidates(
     offset: usize,
     limit: usize,
 ) -> Vec<String> {
-    let point_byte = line
-        .char_indices()
-        .map(|(i, _)| i)
-        .chain(std::iter::once(line.len()))
-        .nth(point)
-        .unwrap_or_else(|| {
-            if line.is_char_boundary(point) {
-                point
-            } else {
-                line.len()
-            }
-        });
+    let point_byte = resolve_point_byte(line, point);
     let Some(head) = line.get(..point_byte) else {
         return vec![];
     };
@@ -286,13 +453,7 @@ pub fn shell_candidates(
             ttql.get(..c.span.0).map(|head| format!("{head}{}", c.raw))
         })
         .collect();
-    match shell {
-        ShellKind::Zsh | ShellKind::Fish => replacements
-            .into_iter()
-            .filter(|r| !r.chars().any(char::is_control))
-            .collect(),
-        ShellKind::Bash => bash_replies(&parsed.current, &replacements),
-    }
+    format_shell_replacements(&parsed.current, replacements, shell)
 }
 
 fn bash_replies(word: &CurrentWord, replacements: &[String]) -> Vec<String> {
@@ -589,5 +750,41 @@ mod tests {
             10,
         );
         assert_eq!(cycled, first);
+    }
+
+    #[test]
+    fn test_shell_candidates_projection_operators_fit_in_default_limit() {
+        let (_dir, store, reg) = setup_test_store_with_files(&["main.rs"]);
+        let line = "ttfm search 'size: ";
+        let cands = shell_candidates(
+            &store,
+            &reg,
+            line,
+            line.len(),
+            WB_DEFAULT,
+            ShellKind::Bash,
+            0,
+            DEFAULT_SHELL_COMPLETION_LIMIT,
+        );
+        assert!(
+            cands.iter().any(|c| c.contains(":^=")),
+            "expected :^= in {cands:?}"
+        );
+        assert!(
+            cands.iter().any(|c| c.contains('+')),
+            "expected + in {cands:?}"
+        );
+        assert!(
+            cands.iter().any(|c| c.contains('*')),
+            "expected * in {cands:?}"
+        );
+        assert!(
+            cands.iter().any(|c| c.contains('/')),
+            "expected / in {cands:?}"
+        );
+        assert!(
+            cands.iter().any(|c| c.contains('%')),
+            "expected % in {cands:?}"
+        );
     }
 }

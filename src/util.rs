@@ -73,6 +73,11 @@ pub fn save_parquet(
     Ok(())
 }
 
+/// `SelectStatement` をインライン副問合せ式 (`SimpleExpr`) に変換します。
+pub fn subquery(stmt: SelectStatement) -> SimpleExpr {
+    SimpleExpr::SubQuery(None, Box::new(stmt.into_sub_query_statement()))
+}
+
 /// 指定したテーブル（Iden）の全内容を Parquet 保存します。
 pub fn write_parquet<I: Iden + Clone + 'static>(
     conn: &Connection,

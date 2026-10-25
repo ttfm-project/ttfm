@@ -2333,6 +2333,29 @@ define_cases! {
             Ok(())
         },
     },
+    scalar_left_label_comparison_unparenthesized_nest_right: {
+        setup: |dir| {
+            let sub = dir.join("sub");
+            std::fs::create_dir_all(&sub)?;
+            std::fs::write(dir.join("small.rs"), vec![0u8; 100])?;
+            std::fs::write(dir.join("big.rs"), vec![0u8; 60000])?;
+            std::fs::write(sub.join("big.txt"), vec![0u8; 60000])?;
+            Ok(())
+        },
+        modify: None,
+        format_query: default_scope,
+        query: "50KB :< extension: &: size:",
+        assert: |res, _dir| {
+            let mut names: Vec<String> = res
+                .results
+                .iter()
+                .flat_map(|r| r.get_all_values("filename"))
+                .collect();
+            names.sort();
+            assert_eq!(names, ["big.rs", "big.txt"]);
+            Ok(())
+        },
+    },
 }
 
 // ──────────────────────────────────────────────
@@ -3088,5 +3111,53 @@ fn test_label_grouping_boundary_wildcards() -> anyhow::Result<()> {
     )?;
     assert_eq!(res_trailing_wildcard.results.len(), 2);
 
+    Ok(())
+}
+
+#[test]
+fn test_nest_rightmost_mtime_comparison_sieves_per_item() -> anyhow::Result<()>
+{
+    let dir = tempdir()?;
+    let root = dir.path();
+    for (name, unix) in [
+        ("old.rs", 1_577_836_800),
+        ("new.rs", 1_767_225_600),
+        ("new.txt", 1_767_225_600),
+    ] {
+        let path = root.join(name);
+        std::fs::write(&path, "")?;
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_unix_time(unix, 0),
+        )?;
+    }
+
+    let registry = TagRegistry::with_standard();
+    let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
+    ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
+
+    let sorted_names = |query: &str| -> anyhow::Result<Vec<String>> {
+        let res = search::search_nowarn(
+            &store,
+            &registry,
+            query,
+            ttfm::SearchOptions::default(),
+        )?;
+        let mut names: Vec<String> =
+            res.results.iter().map(|r| r.raw_repr()).collect();
+        names.sort();
+        Ok(names)
+    };
+
+    assert_eq!(
+        sorted_names(r#"extension: &: mtime: :> "2025-01-01""#)?,
+        ["new.rs", "new.txt"]
+    );
+    assert_eq!(
+        sorted_names(r#"extension: &: mtime: :< "2025-01-01""#)?,
+        ["old.rs"]
+    );
     Ok(())
 }

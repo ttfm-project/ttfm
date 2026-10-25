@@ -110,7 +110,7 @@ fn write_add_volatile_creates_item_ref_and_user_tag() {
             && val == "A"),
         "user_tags missing project:A for id {new_id}: {tags:?}"
     );
-    assert_eq!(resp.updated, 4); // ItemKind + Content + project:A + new item_id
+    assert_eq!(resp.updated, 3);
 }
 
 // ──────────────────────────────────────────────
@@ -420,11 +420,10 @@ fn read_rank(store: &Store, item_id: i64) -> Option<i64> {
 }
 
 #[test]
-fn write_rank_tags_item_ref_without_touching_the_rank_column() {
+fn write_rank_tags_item_ref_stores_default_plus_user_rank() {
     let (store, registry, _dir) = setup();
     let id =
         ttfm::tagging::add_item(&store, &registry, "note", "my note").unwrap();
-    let before = read_rank(&store, id);
 
     write(
         &store,
@@ -439,7 +438,7 @@ fn write_rank_tags_item_ref_without_touching_the_rank_column() {
     assert!(read_user_tags(&store)
         .iter()
         .any(|(i, t, v)| *i == id && t == "rank" && v == "5"));
-    assert_eq!(read_rank(&store, id), before);
+    assert_eq!(read_rank(&store, id), Some(5));
 }
 
 // ──────────────────────────────────────────────
@@ -632,16 +631,17 @@ fn read_file_rank(store: &Store, item_id: i64) -> Option<i64> {
 }
 
 #[test]
-fn write_rank_tags_file_ref_without_touching_the_rank_column() {
+fn write_rank_tags_file_ref_stores_default_plus_user_rank() {
     let (store, registry, file_id, _dir) = setup_with_indexed_file();
     let initial = read_file_rank(&store, file_id).unwrap_or(0);
+    let user_rank = initial + 7;
 
     write(
         &store,
         &registry,
         vec![WriteAction::Add {
             item: ItemId::Stored(file_id),
-            tags: vec![TagOp::Append(TypedTag::new(SType::Rank, initial + 7))],
+            tags: vec![TagOp::Append(TypedTag::new(SType::Rank, user_rank))],
         }],
     )
     .unwrap();
@@ -649,7 +649,7 @@ fn write_rank_tags_file_ref_without_touching_the_rank_column() {
     assert!(read_user_tags(&store)
         .iter()
         .any(|(i, t, _)| *i == file_id && t == "rank"));
-    assert_eq!(read_file_rank(&store, file_id), Some(initial));
+    assert_eq!(read_file_rank(&store, file_id), Some(user_rank));
 }
 
 // ──────────────────────────────────────────────

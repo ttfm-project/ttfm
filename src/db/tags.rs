@@ -629,6 +629,7 @@ fn update_tag_type_partition(
         swap_partition(&tmp_part, &part_dir, &old_part)?;
     }
     let _ = std::fs::remove_dir_all(&tmp_type);
+    let _ = std::fs::remove_dir(store.temp_tags_dir());
     Ok(())
 }
 
@@ -886,6 +887,7 @@ mod tests {
         std::fs::File::create(store.complete_path()).unwrap();
         update_tags_partitions(&store, &store.conn, &registry, &["mimetype"])
             .unwrap();
+        assert!(!store.temp_tags_dir().exists());
 
         let read_labels = |origin: Origin| -> Vec<String> {
             let mime_parquet = store

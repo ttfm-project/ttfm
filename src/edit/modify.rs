@@ -1,16 +1,11 @@
 use super::{
-    parse::{EditQuery, EditQueryLeaf},
+    parse::EditQuery,
     write::{DeleteTarget, TagOp, WriteAction},
     EditStrategy, QueryType,
 };
-use crate::query::ast::{
-    BasicOp, ComparisonNode, ComparisonOp, Operand, QueryNode,
-};
 use crate::response::Item;
 use crate::tag::TagRegistry;
-use crate::types::{
-    Bitical, BiticalType, ItemId, Label, SType, TagType, TypedTag,
-};
+use crate::types::{ItemId, Label, Origin, SType, TagType, TypedTag};
 use crate::util::DotOk;
 use anyhow::{bail, Result};
 
@@ -24,6 +19,21 @@ enum Directive {
     Tag(TypedTag, EditStrategy),
     DeleteType(TagType),
     DeleteTag(TypedTag),
+}
+
+fn append_actions(id: &ItemId, item: &Item, tag: TypedTag) -> Vec<WriteAction> {
+    let has_user_tag = item
+        .tags
+        .entries
+        .iter()
+        .any(|e| e.origin == Origin::User && e.typed_tag == tag);
+    if has_user_tag {
+        return vec![];
+    }
+    vec![WriteAction::Add {
+        item: id.clone(),
+        tags: vec![TagOp::Append(tag)],
+    }]
 }
 
 impl Directive {
@@ -46,10 +56,7 @@ impl Directive {
                     strategy
                 };
                 match effective_strategy {
-                    EditStrategy::Append => vec![WriteAction::Add {
-                        item: id.clone(),
-                        tags: vec![TagOp::Append(tag)],
-                    }],
+                    EditStrategy::Append => append_actions(id, item, tag),
                     EditStrategy::Replace => vec![
                         WriteAction::Delete {
                             item: id.clone(),
@@ -91,11 +98,11 @@ impl Directive {
 }
 
 impl QueryType {
-    // (query_type, tag_type, value) → Directive
     fn to_directive(
         &self,
         tag_type: TagType,
         value: Option<Label>,
+        strategy: EditStrategy,
         registry: &TagRegistry,
     ) -> Result<Directive> {
         match (self, value) {
@@ -104,9 +111,7 @@ impl QueryType {
                 tag_type.as_str()
             ),
             (QueryType::Tag, Some(v)) => {
-                let strategy = get_strategy(&tag_type, registry)?;
                 let tag = TypedTag::retag(tag_type, &v);
-                let tag = interpret_tag_value(tag, registry)?;
                 Ok(Directive::Tag(tag, strategy))
             }
             (QueryType::Untag, None) => {
@@ -125,91 +130,6 @@ impl QueryType {
 // ヘルパー
 // ──────────────────────────────────────────────
 
-fn build_leaf_label(l: &EditQueryLeaf) -> Result<Label> {
-    let s = l.value();
-    if l.quoted {
-        return Label::other(Bitical::String(s)).to_ok();
-    }
-    use crate::query::format::OperandFormat;
-    match Bitical::parse(&s) {
-        Some(Ok(b)) => {
-            crate::query::format::attach_formatted_node(Label::other(b)).to_ok()
-        }
-        Some(Err(e)) => bail!("invalid value {s:?}: {e}"),
-        None => bail!("invalid value {s:?}"),
-    }
-}
-
-fn interpret_tag_value(
-    tag: TypedTag,
-    registry: &TagRegistry,
-) -> Result<TypedTag> {
-    let resolved = if let Some(f) = registry.get(tag.tag_type().as_str()) {
-        let predicate = f.query().interpret(
-            &Operand::TypeRef(tag.tag_type()),
-            ComparisonOp::Label(BasicOp::Eq),
-            &tag.label,
-        )?;
-        let not_single = || {
-            crate::query::error::tag_value_not_a_single_value(
-                tag.tag_type().as_str(),
-                &tag.label.as_str(),
-            )
-        };
-        let QueryNode::Comparison(ComparisonNode { rest, .. }) = predicate
-        else {
-            return Err(not_single());
-        };
-        let [(ComparisonOp::Label(BasicOp::Eq), Operand::Literal(value))] =
-            rest.as_slice()
-        else {
-            return Err(not_single());
-        };
-        TypedTag::retag(tag.tag_type(), value)
-    } else {
-        tag
-    };
-
-    let resolved = if let Some(expected) = registry
-        .type_config(&resolved.tag_type())
-        .and_then(|c| c.bitical_type)
-    {
-        match (expected, resolved.value()) {
-            (BiticalType::Double, Bitical::Integer(i)) => {
-                TypedTag::new(resolved.tag_type(), i as f64)
-            }
-            (BiticalType::Uuid, Bitical::String(s)) => {
-                if let Ok(u) = uuid::Uuid::parse_str(&s) {
-                    TypedTag::new(resolved.tag_type(), Bitical::Uuid(u))
-                } else {
-                    bail!(
-                        "type '{}' is uuid, cannot assign string. Please enter a uuid or change type definition.",
-                        resolved.tag_type()
-                    );
-                }
-            }
-            (expected, actual_val) if expected != actual_val.name() => {
-                let article = match expected {
-                    BiticalType::Integer => "an",
-                    _ => "a",
-                };
-                bail!(
-                    "type '{}' is {}, cannot assign {}. Please enter {article} {} or change type definition.",
-                    resolved.tag_type(),
-                    expected,
-                    actual_val.name(),
-                    expected
-                );
-            }
-            _ => resolved,
-        }
-    } else {
-        resolved
-    };
-
-    resolved.to_ok()
-}
-
 pub(crate) fn is_type_item(item: &Item) -> bool {
     item.item_kind == crate::types::ItemKind::Type
         || item.tags.entries.iter().any(|e| {
@@ -221,25 +141,6 @@ pub(crate) fn is_type_item(item: &Item) -> bool {
             .tags
             .iter()
             .any(|t| t.tag_type() == TagType::Base(SType::Type))
-}
-
-fn get_strategy(
-    tag_type: &TagType,
-    registry: &TagRegistry,
-) -> Result<EditStrategy> {
-    match registry.get(tag_type.as_str()) {
-        Some(f) => match f.edit() {
-            Some(e) => Ok(e.strategy()),
-            None => bail!(
-                "tag type '{}' is registered but not editable (Forbidden)",
-                tag_type
-            ),
-        },
-        None => Ok(registry
-            .type_config(tag_type)
-            .and_then(|c| c.strategy)
-            .unwrap_or(EditStrategy::Append)),
-    }
 }
 
 fn validate_type_config_assignment(
@@ -331,11 +232,16 @@ pub fn resolve_nodes(
             if tag_type.as_str().is_empty() {
                 bail!("empty tag type in EditQuery");
             }
-            let label = n.label.as_ref().map(build_leaf_label).transpose()?;
+            let edit = registry.edit_of(&tag_type)?;
             if matches!(query_type, QueryType::Untag) {
                 check_untag_allowed(&tag_type, registry)?;
             }
-            let strategy = get_strategy(&tag_type, registry)?;
+            let label = n
+                .label
+                .as_ref()
+                .map(|l| edit.validate(&l.value(), l.quoted))
+                .transpose()?;
+            let strategy = edit.strategy();
             Ok(ResolvedNode {
                 tag_type,
                 label,
@@ -492,6 +398,7 @@ pub fn modify(
             query_type.to_directive(
                 n.tag_type.clone(),
                 n.label.clone(),
+                n.strategy,
                 registry,
             )
         })
@@ -579,16 +486,6 @@ mod tests {
         modify(item, &nodes, query_type, registry)
     }
 
-    fn leaf(q: &str) -> EditQueryLeaf {
-        eq(&format!("t:{q}"), QueryType::Tag)
-            .nodes
-            .into_iter()
-            .next()
-            .unwrap()
-            .label
-            .unwrap()
-    }
-
     fn make_volatile_item(stype: SType, repr_value: &str) -> Item {
         use crate::types::{Bitical, Intrinsic, Rank};
         let repr_label = TypedTag::new(
@@ -606,36 +503,13 @@ mod tests {
         }
     }
 
-    // ── build_leaf_label テスト ───────────────────
-
     #[test]
-    fn integer_value_is_typed_as_integer() {
-        let label = build_leaf_label(&leaf("5")).unwrap();
-        assert_eq!(label, Label::other(Bitical::Integer(5)));
-    }
-
-    #[test]
-    fn double_value_is_typed_as_double() {
-        let label = build_leaf_label(&leaf("42.1")).unwrap();
-        assert_eq!(label, Label::other(Bitical::Double(42.1)));
-    }
-
-    #[test]
-    fn boolean_value_is_typed_as_boolean() {
-        let label = build_leaf_label(&leaf("true")).unwrap();
-        assert_eq!(label, Label::other(Bitical::Boolean(true)));
-    }
-
-    #[test]
-    fn quoted_value_stays_string() {
-        let label = build_leaf_label(&leaf("\"42\"")).unwrap();
-        assert_eq!(label, Label::other(Bitical::String("42".into())));
-    }
-
-    #[test]
-    fn braced_value_renders_as_literal() {
-        let label = build_leaf_label(&leaf("{1}")).unwrap();
-        assert_eq!(label, Label::other(Bitical::String("{1}".into())));
+    fn test_validate_default_and_user_type() -> Result<()> {
+        let reg = TagRegistry::default();
+        let edit = reg.edit_of(&TagType::from("weight"))?;
+        let l = edit.validate("130", false)?;
+        assert_eq!(l.value(), Bitical::Integer(130));
+        Ok(())
     }
 
     // ── modify テスト ─────────────────────────
@@ -685,19 +559,6 @@ mod tests {
         );
         assert!(
             matches!(&actions[1], WriteAction::Add { tags, .. } if matches!(&tags[0], TagOp::Replace(t) if t.tag_type() == TagType::Base(SType::Rank) && t.label.as_i64() == 5))
-        );
-    }
-
-    #[test]
-    fn interpret_tag_value_applies_tagfn_interpret() {
-        let label =
-            TypedTag::new(TagType::from("size"), Bitical::String("1k".into()));
-        let interpreted = interpret_tag_value(label, &registry()).unwrap();
-        assert_eq!(
-            interpreted,
-            TypedTag::new(SType::Size, 1024),
-            "TagFn (SizeFn::interpret) must interpret unit-suffixed values, \
-             independent of whether the type is currently editable"
         );
     }
 
@@ -1108,6 +969,26 @@ mod tests {
     }
 
     #[test]
+    fn modify_volatile_definition_kind_follows_type_tag() {
+        use crate::types::Origin;
+        let mut item = make_volatile_item(SType::Type, "filename:a.txt");
+        item.tags
+            .push(TypedTag::new(SType::Type, "tag"), Origin::Builtin);
+        let actions = modify_query(
+            &item,
+            Some(&eq("milestone:m1", QueryType::Tag)),
+            QueryType::Tag,
+            &registry(),
+        )
+        .unwrap();
+        let tags = add_tags(&actions);
+        assert!(has_append(tags, |l| {
+            l.tag_type() == TagType::Base(SType::ItemKind)
+                && l.as_str() == "tag"
+        }));
+    }
+
+    #[test]
     fn modify_volatile_no_edit_query_registration_only() {
         let item = make_volatile_item(SType::TypedTag, "project:A");
         let actions =
@@ -1248,54 +1129,6 @@ mod tests {
             &reg
         )
         .is_err());
-    }
-
-    #[test]
-    fn test_get_strategy_uses_type_config() {
-        let reg = registry();
-        let tag_quota = TagType::from("quota");
-        assert_eq!(
-            get_strategy(&tag_quota, &reg).unwrap(),
-            EditStrategy::Append
-        );
-
-        let mut type_reg = crate::tag::TypeRegistry::default();
-        type_reg.insert(
-            tag_quota.clone(),
-            crate::tag::TypeConfig {
-                strategy: Some(EditStrategy::Replace),
-                ..Default::default()
-            },
-        );
-        let reg_with_cfg = TagRegistry::with_standard();
-        reg_with_cfg.set_type_configs_for_test(type_reg);
-        assert_eq!(
-            get_strategy(&tag_quota, &reg_with_cfg).unwrap(),
-            EditStrategy::Replace
-        );
-    }
-
-    #[test]
-    fn test_interpret_tag_value_rejects_mismatched_bitical_type() {
-        let tag_score = TagType::from("score");
-        let mut type_reg = crate::tag::TypeRegistry::default();
-        type_reg.insert(
-            tag_score.clone(),
-            crate::tag::TypeConfig {
-                bitical_type: Some(crate::types::BiticalType::Integer),
-                ..Default::default()
-            },
-        );
-        let reg = TagRegistry::with_standard();
-        reg.set_type_configs_for_test(type_reg);
-
-        let valid_tag = TypedTag::new(tag_score.clone(), 100i64);
-        assert!(interpret_tag_value(valid_tag, &reg).is_ok());
-
-        let invalid_tag = TypedTag::new(tag_score.clone(), "high");
-        let err = interpret_tag_value(invalid_tag, &reg).unwrap_err();
-        assert!(err.to_string().contains("type 'score' is integer"));
-        assert!(err.to_string().contains("cannot assign string"));
     }
 
     #[test]

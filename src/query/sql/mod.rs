@@ -232,20 +232,6 @@ pub fn build_flat_table_sql(
     q
 }
 
-/// ノードがスカラー boolean として扱われるべきかを判定する。
-/// CalculationMatch はタグ参照を含む場合はアイテムフィルタとして扱う。
-fn is_boolean_only_node(n: &ResolvedNode) -> bool {
-    match n {
-        ResolvedNode::AggregationMatch { .. }
-        | ResolvedNode::AggregationAggregationMatch { .. }
-        | ResolvedNode::AggregationCalculationMatch { .. }
-        | ResolvedNode::AggregationTagMatch { .. }
-        | ResolvedNode::ScalarMatch { .. } => true,
-        ResolvedNode::CalculationMatch { calc, .. } => !calc.contains_tag(),
-        _ => false,
-    }
-}
-
 /// すべてのクエリ種別に対する統一 SQL エントリポイント。
 /// ResolvedNode の構造を直接見てディスパッチする。
 ///   - LabelSetOp またはnvalue比較なしのProjection → build_fetch_nest_sql (Lv.2)
@@ -263,98 +249,10 @@ pub fn build_fetch_sql(
     // （items / 定義枝）にのみ適用し、ラベルグループ（Nest/Projection）と
     // スカラー・ブーリアンには適用しない。
     let orders = resolver.resolved_order();
-    if definition::mixed_difference_needs_item_filter(&resolver.resolved_query)
-    {
-        let rewritten = definition::rewrite_definition_ref_as_item_filter(
-            &resolver.resolved_query,
-        );
-        let pick = PickNode::new(src, &rewritten, storage);
-        let limit = if n > 0 { Some(n + 1) } else { None };
-        return Ok(build_fetch_items_sql(
-            src,
-            &pick,
-            limit,
-            Some(offset),
-            orders,
-        ));
-    }
-    if let ResolvedNode::Difference(l, r) = &resolver.resolved_query {
-        if resolver.resolved_query.is_pure_definition() {
-            let r_defs: Vec<&definition::ResolvedDefinition> = match r.as_ref()
-            {
-                ResolvedNode::DefinitionRef { def, .. } => vec![def],
-                ResolvedNode::Or(nodes) => nodes
-                    .iter()
-                    .filter_map(|n| match n {
-                        ResolvedNode::DefinitionRef { def, .. } => Some(def),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => vec![],
-            };
-            let l_defs: Vec<&definition::ResolvedDefinition> = match l.as_ref()
-            {
-                ResolvedNode::DefinitionRef { def, .. } => vec![def],
-                ResolvedNode::Or(nodes) => nodes
-                    .iter()
-                    .filter_map(|n| match n {
-                        ResolvedNode::DefinitionRef { def, .. } => Some(def),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => vec![],
-            };
-            if !l_defs.is_empty() {
-                let r_name_sql = if !r_defs.is_empty() {
-                    let mut r_names = r_defs.iter().map(|d| {
-                        definition::build_definition_name_sql(d, storage)
-                    });
-                    let first = r_names.next().unwrap();
-                    Some(r_names.fold(first, |mut acc, next| {
-                        acc.union(sea_query::UnionType::Distinct, next);
-                        acc
-                    }))
-                } else {
-                    None
-                };
-
-                let branches: Vec<SelectStatement> = l_defs
-                    .iter()
-                    .map(|d| {
-                        let mut fetch = definition::build_definition_fetch_sql(
-                            src,
-                            d,
-                            storage,
-                            resolver.short(),
-                        );
-                        if let Some(r_sql) = &r_name_sql {
-                            fetch.and_where(
-                                Expr::col((Sub, Col::Name))
-                                    .not_in_subquery(r_sql.clone()),
-                            );
-                        }
-                        fetch
-                    })
-                    .collect();
-
-                return Ok(definition::build_add_definitions_sql(
-                    src, branches, orders, n, offset,
-                ));
-            }
-        }
-    }
-    // 定義参照（単体または Or だけで到達可能な枝）を含む場合:
-    // 定義枝と src 由来枝を fetch レベルで束ねる（add_definitions）。
-    // representative は projection と同じ decode_nest 経路で型付けする。
-    if let Some((defs, rest)) =
-        resolver.resolved_query.split_definition_branches()
-    {
-        if resolver.short()
-            && orders.is_empty()
-            && rest.is_none()
-            && defs.len() == 1
-        {
-            if let ResolvedNode::DefinitionRef { def, .. } = defs[0] {
+    let query = &resolver.resolved_query;
+    if query.is_pure_definition() {
+        if let ResolvedNode::DefinitionRef { def, .. } = query {
+            if resolver.short() && orders.is_empty() {
                 if let Some(sql) = definition::try_build_physical_order_scan(
                     src, def, storage, orders, n, offset,
                 ) {
@@ -362,26 +260,45 @@ pub fn build_fetch_sql(
                 }
             }
         }
-        let rest_fetch = if storage.item_references.is_some()
-            || storage.tags_dir.is_some()
-        {
-            rest.as_ref().map(|rest_node| {
-                let pick = PickNode::new(src, rest_node, storage);
-                build_fetch_items_sql_impl(src, &pick, None, None, true, &[])
-            })
-        } else {
-            None
-        };
-        return crate::query::lens_builder::add_definitions(
+        return Ok(crate::query::lens_builder::add_definitions(
             src,
-            &defs,
-            rest_fetch,
+            &query.definition_branches(false),
+            None,
             n,
             offset,
             orders,
             storage,
             resolver.short(),
-        );
+        ));
+    }
+    let branches = query.definition_branches(true);
+    if !branches.is_empty() {
+        let items_fetch = (storage.item_references.is_some()
+            || storage.tags_dir.is_some())
+        .then(|| {
+            build_fetch_items_sql_impl(
+                src,
+                &PickNode::new(
+                    src,
+                    &query.without_unregistered_definitions(),
+                    storage,
+                ),
+                None,
+                None,
+                true,
+                &[],
+            )
+        });
+        return Ok(crate::query::lens_builder::add_definitions(
+            src,
+            &branches,
+            items_fetch,
+            n,
+            offset,
+            orders,
+            storage,
+            resolver.short(),
+        ));
     }
     if resolver.get_projection().is_some() {
         if resolver.get_label_set_op_node().is_some()
@@ -452,7 +369,7 @@ pub fn build_fetch_sql(
         // ラベル比較と演算子が異なるためバリアントで構造的に区別できる
         ResolvedNode::And(nodes) | ResolvedNode::Or(nodes)
             if !nodes.is_empty()
-                && nodes.iter().all(|n| is_boolean_only_node(n)) =>
+                && nodes.iter().all(|n| n.is_boolean_only()) =>
         {
             return Ok(build_boolean_sql(
                 src,

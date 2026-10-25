@@ -609,21 +609,26 @@ impl Lens {
             lens.register(desc);
         }
         // TypeConfig 定義（ユーザー定義・カスタム型の物理ストレージマッピング）
-        for (tag_type, bt) in registry
+        for (tag_type, cfg) in registry
             .type_configs()
             .iter()
-            .filter(|(t, c)| {
-                c.is_explicit && registry.get(t.as_str()).is_none()
-            })
-            .filter_map(|(t, c)| c.bitical_type.map(|b| (t, b)))
+            .filter(|(t, _)| registry.get(t.as_str()).is_none())
         {
+            let Some(bt) = cfg.bitical_type else {
+                continue;
+            };
+            let logical_type = if cfg.is_explicit {
+                sql_to_logical(bt)
+            } else {
+                LogicalType::Any
+            };
             lens.register(TagDescriptor {
                 tag_type: tag_type.clone(),
                 storage: StorageMapping::Basic {
                     column: bt.to_column(),
                     tag_type: tag_type.as_str().to_string(),
                 },
-                logical_type: sql_to_logical(bt),
+                logical_type,
                 logical_function: None,
                 sys_id: None,
             });

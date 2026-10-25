@@ -28,10 +28,12 @@ use crate::query::ast::Candidate;
 use crate::query::lens_resolver::{DefinitionStorage, ResolvedOrder};
 use crate::types::{Bitical, ItemId, ItemKind, Origin, Rank, TypedTag};
 use sea_query::{
-    BinOper, CaseStatement, CommonTableExpression, Expr, Func, JoinType, Query,
-    SelectStatement, UnionType, WithClause,
+    BinOper, CaseStatement, CommonTableExpression, Expr, ExprTrait, Func,
+    JoinType, Query, SelectStatement, UnionType, WithClause,
 };
 use std::path::{Path, PathBuf};
+
+const UNREGISTERED_DEFINITION_RANK_OFFSET: Rank = 20;
 
 /// 定義アイテム参照の Resolved 段。展開後の木（定義型の `TypedTag` か
 /// `QueryNode::OriginRef`）に registry 照合結果（candidates / reserved）と
@@ -118,6 +120,13 @@ impl ResolvedDefinition {
             origins,
             reserved,
             recorded,
+        }
+    }
+
+    pub(crate) fn unregistered(&self) -> Self {
+        Self {
+            recorded: false,
+            ..self.clone()
         }
     }
 }
@@ -226,7 +235,10 @@ fn assemble_definition_rows(
     let volatile_sel = Query::select()
         .column(Col::ItemId)
         .column(Col::Name)
-        .column(Col::Rank)
+        .expr_as(
+            Expr::col(Col::Rank).sub(UNREGISTERED_DEFINITION_RANK_OFFSET),
+            Col::Rank,
+        )
         .expr_as(
             Expr::case(
                 Expr::col(Col::ItemId).is_not_null(),
@@ -276,87 +288,124 @@ fn name_condition_on(
     }
 }
 
-/// 定義アイテムを name で絞り込んだ pick SQL（item_id, rank, item_kind）。
-/// `exact` が true なら等値比較（完全一致検索）、false なら glob パターンマッチ（glob検索）。
-pub(crate) fn build_definition_pick_sql(
+/// 登録済み定義アイテムだけを name で絞り込んだ pick SQL。
+/// 未登録（Volatile）行は oneview のアイテムにしない。
+pub(crate) fn build_registered_definition_pick_sql(
     resolved: &ResolvedDefinition,
     storage: &DefinitionStorage,
 ) -> SelectStatement {
-    Query::select()
+    let mut q = Query::select()
         .column(Col::ItemId)
         .column(Col::Rank)
-        .column(Col::ItemKind)
-        .from_subquery(build_definition_rows(resolved, storage), Sub)
+        .expr_as(Expr::val(resolved.kind.as_str()), Col::ItemKind)
+        .from(Stored)
         .and_where(name_condition(&resolved.pattern, resolved.exact))
-        .to_owned()
+        .to_owned();
+    if !resolved.recorded {
+        q.and_where(Expr::val(1).eq(0));
+    }
+    q.with_cte(stored_cte(
+        storage.item_references.as_deref(),
+        resolved.kind,
+    ));
+    q
 }
 
-pub(crate) fn rewrite_definition_ref_as_item_filter(
-    node: &crate::query::lens_resolver::ResolvedNode,
-) -> crate::query::lens_resolver::ResolvedNode {
-    use crate::query::ast::{BasicOp, ComparisonOp};
-    use crate::query::lens_resolver::ResolvedNode;
-    use crate::query::lens_schema::StorageMapping;
-    use crate::types::{Label, SType, TagType};
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DefinitionBranch {
+    def: ResolvedDefinition,
+    filters: Vec<NameFilter>,
+}
 
-    match node {
-        ResolvedNode::DefinitionRef { def, .. } => {
-            let (col, stype) = match def.kind {
-                ItemKind::Tag => (Col::TypedTag, SType::TypedTag),
-                _ => (Col::Type, SType::Type),
-            };
-            ResolvedNode::Match {
-                tag_type: TagType::Base(stype),
-                storage: StorageMapping::Fixed(col),
-                bitical_type: BiticalType::String,
-                op: ComparisonOp::Scalar(BasicOp::Eq),
-                label: Label::from(def.pattern.as_str()),
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NameFilter {
+    In(Vec<DefinitionBranch>),
+    NotIn(Vec<DefinitionBranch>),
+}
+
+impl DefinitionBranch {
+    pub(crate) fn new(def: ResolvedDefinition) -> Self {
+        Self {
+            def,
+            filters: Vec::new(),
+        }
+    }
+
+    pub(crate) fn filtered(mut self, filter: NameFilter) -> Self {
+        self.filters.push(filter);
+        self
+    }
+
+    pub(crate) fn names_sql(
+        &self,
+        storage: &DefinitionStorage,
+    ) -> SelectStatement {
+        let mut q = build_definition_name_sql(&self.def, storage);
+        apply_name_filters(
+            &mut q,
+            Expr::col(Col::Name).into(),
+            &self.filters,
+            storage,
+        );
+        q
+    }
+
+    pub(crate) fn fetch_sql(
+        &self,
+        src: &Src,
+        storage: &DefinitionStorage,
+        short: bool,
+    ) -> SelectStatement {
+        let mut q = build_definition_fetch_sql(src, &self.def, storage, short);
+        apply_name_filters(
+            &mut q,
+            Expr::col((Sub, Col::Name)).into(),
+            &self.filters,
+            storage,
+        );
+        q
+    }
+}
+
+fn names_union_sql(
+    branches: &[DefinitionBranch],
+    storage: &DefinitionStorage,
+) -> SelectStatement {
+    branches
+        .iter()
+        .map(|b| b.names_sql(storage))
+        .reduce(union_distinct)
+        .unwrap()
+}
+
+fn union_distinct(
+    mut acc: SelectStatement,
+    next: SelectStatement,
+) -> SelectStatement {
+    acc.union(UnionType::Distinct, next);
+    acc
+}
+
+fn apply_name_filters(
+    q: &mut SelectStatement,
+    col: sea_query::SimpleExpr,
+    filters: &[NameFilter],
+    storage: &DefinitionStorage,
+) {
+    for filter in filters {
+        match filter {
+            NameFilter::In(bs) => {
+                q.and_where(
+                    col.clone().in_subquery(names_union_sql(bs, storage)),
+                );
+            }
+            NameFilter::NotIn(bs) => {
+                q.and_where(
+                    col.clone().not_in_subquery(names_union_sql(bs, storage)),
+                );
             }
         }
-        ResolvedNode::Or(nodes) => ResolvedNode::Or(
-            nodes
-                .iter()
-                .map(rewrite_definition_ref_as_item_filter)
-                .collect(),
-        ),
-        ResolvedNode::And(nodes) => ResolvedNode::And(
-            nodes
-                .iter()
-                .map(rewrite_definition_ref_as_item_filter)
-                .collect(),
-        ),
-        ResolvedNode::Difference(l, r) => ResolvedNode::Difference(
-            Box::new(rewrite_definition_ref_as_item_filter(l)),
-            Box::new(rewrite_definition_ref_as_item_filter(r)),
-        ),
-        other => other.clone(),
     }
-}
-
-fn has_definition_ref(
-    node: &crate::query::lens_resolver::ResolvedNode,
-) -> bool {
-    use crate::query::lens_resolver::ResolvedNode;
-    match node {
-        ResolvedNode::DefinitionRef { .. } => true,
-        ResolvedNode::Or(nodes) | ResolvedNode::And(nodes) => {
-            nodes.iter().any(has_definition_ref)
-        }
-        ResolvedNode::Difference(l, r) => {
-            has_definition_ref(l) || has_definition_ref(r)
-        }
-        _ => false,
-    }
-}
-
-pub(crate) fn mixed_difference_needs_item_filter(
-    node: &crate::query::lens_resolver::ResolvedNode,
-) -> bool {
-    matches!(
-        node,
-        crate::query::lens_resolver::ResolvedNode::Difference(_, _)
-    ) && !node.is_pure_definition()
-        && has_definition_ref(node)
 }
 
 /// 定義アイテムを name で絞り込んだ fetch SQL（tags・representative・name 付き）。
@@ -604,7 +653,13 @@ fn stored_cte(item_references: Option<&Path>, kind: ItemKind) -> WithClause {
         Query::select()
             .column(Col::ItemId)
             .expr_as(Expr::col(Col::Content), Col::Name)
-            .column(Col::Rank)
+            .expr_as(
+                Func::coalesce([
+                    Expr::col(Col::Rank).into(),
+                    Expr::val(0).into(),
+                ]),
+                Col::Rank,
+            )
             .from_subquery(
                 util::parquet_query(&ir_path.to_string_lossy()),
                 Tbl::ItemReferences,
@@ -741,6 +796,48 @@ mod tests {
     use crate::db::Store;
     use sea_query::PostgresQueryBuilder;
     use tempfile::tempdir;
+
+    fn type_glob_resolved() -> ResolvedDefinition {
+        ResolvedDefinition::for_tag(
+            ItemKind::Type,
+            TypedTag::new(crate::types::TagType::from("type"), "*"),
+            Vec::new(),
+            Vec::new(),
+            crate::rank::SystemRank::DEFAULT,
+        )
+    }
+
+    fn storage_with_item_references() -> (tempfile::TempDir, DefinitionStorage)
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("item_references.parquet");
+        std::fs::File::create(&path).unwrap();
+        let storage = DefinitionStorage {
+            item_references: Some(path),
+            ..DefinitionStorage::default()
+        };
+        (dir, storage)
+    }
+
+    #[test]
+    fn definition_rows_offset_unregistered_rank_and_default_stored_rank() {
+        let (_dir, storage) = storage_with_item_references();
+        let sql = build_definition_rows(&type_glob_resolved(), &storage)
+            .to_string(PostgresQueryBuilder);
+        assert!(sql.contains(r#""rank" - 20"#), "{sql}");
+        assert!(sql.contains(r#"COALESCE("rank", 0)"#), "{sql}");
+    }
+
+    #[test]
+    fn registered_pick_reads_only_stored_rows() {
+        let (_dir, storage) = storage_with_item_references();
+        let sql = build_registered_definition_pick_sql(
+            &type_glob_resolved(),
+            &storage,
+        )
+        .to_string(PostgresQueryBuilder);
+        assert!(!sql.contains(r#""volatile""#), "{sql}");
+    }
 
     #[test]
     fn test_name_condition_caret_is_literal_not_prefix_glob() {
@@ -900,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_and_pick_definition_sql_use_tags_dictionary() {
+    fn test_count_scans_dictionary_and_mixed_pick_reads_stored_rows() {
         use crate::query::lens_resolver::Resolver;
         use crate::tag::TagRegistry;
 
@@ -939,11 +1036,16 @@ mod tests {
         .unwrap()
         .to_string(PostgresQueryBuilder);
         assert!(
-            pick_sql.contains("hive_partitioning")
-                || pick_sql.contains("type=project"),
+            pick_sql.contains("\"stored\"") && pick_sql.contains("project:a*"),
             "{pick_sql}"
         );
+        assert!(pick_sql.contains("oneview"), "{pick_sql}");
         assert!(!pick_sql.contains("user_tags"), "{pick_sql}");
+        assert!(
+            !pick_sql.contains("hive_partitioning")
+                && !pick_sql.contains("type=project"),
+            "{pick_sql}"
+        );
     }
 
     #[test]

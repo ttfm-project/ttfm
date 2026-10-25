@@ -1,9 +1,9 @@
 use super::sql::{self, UserTagDelete};
 use crate::db::{Col, Store, TargetTable, Tbl};
 use crate::types::{BiticalType, ItemId, Origin, SType, TagType, TypedTag};
-use crate::util::{parquet_query, ParquetExt};
+use crate::util::{parquet_query, IdenExt, ParquetExt, SelectExt};
 use anyhow::Result;
-use sea_query::{Expr, PostgresQueryBuilder, Query, UnionType};
+use sea_query::{Expr, Order, PostgresQueryBuilder, Query, UnionType};
 use strum::IntoEnumIterator;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +37,159 @@ pub struct WriteResponse {
 }
 
 // ──────────────────────────────────────────────
+// rank 列の解決
+// ──────────────────────────────────────────────
+
+fn builtin_default_rank(registry: &crate::tag::TagRegistry, id: i64) -> i64 {
+    if Origin::within(id) != Origin::Builtin {
+        return 0;
+    }
+    let offset = (id - Origin::Builtin.block_lo()) as u32;
+    registry
+        .builtin_name_for_offset(offset)
+        .map(|name| crate::rank::get_rank_by_name(registry, name))
+        .unwrap_or(0)
+}
+
+fn extract_rank_op(op: &TagOp) -> Option<i64> {
+    let tag = match op {
+        TagOp::Append(t) | TagOp::Replace(t) => t,
+    };
+    if tag.tag_type() != TagType::Base(SType::Rank) {
+        return None;
+    }
+    tag.as_str().parse::<i64>().ok()
+}
+
+fn is_rank_delete(target: &DeleteTarget) -> bool {
+    match target {
+        DeleteTarget::Type(tt) => tt.as_str() == "rank",
+        DeleteTarget::Tag(t) => t.tag_type().as_str() == "rank",
+    }
+}
+
+fn rank_target_map<'a>(
+    id: i64,
+    item_ranks: &'a mut rustc_hash::FxHashMap<i64, i64>,
+    file_ranks: &'a mut rustc_hash::FxHashMap<i64, i64>,
+) -> &'a mut rustc_hash::FxHashMap<i64, i64> {
+    if Origin::within(id) == Origin::File {
+        file_ranks
+    } else {
+        item_ranks
+    }
+}
+
+fn record_rank_change(
+    registry: &crate::tag::TagRegistry,
+    action: &WriteAction,
+    item_ranks: &mut rustc_hash::FxHashMap<i64, i64>,
+    file_ranks: &mut rustc_hash::FxHashMap<i64, i64>,
+) {
+    match action {
+        WriteAction::Delete { item, tags } => {
+            if !tags.iter().any(is_rank_delete) {
+                return;
+            }
+            let id = item.as_i64();
+            let rank = builtin_default_rank(registry, id);
+            rank_target_map(id, item_ranks, file_ranks).insert(id, rank);
+        }
+        WriteAction::Add { item, tags } => {
+            let Some(val) = tags.iter().find_map(extract_rank_op) else {
+                return;
+            };
+            let id = item.as_i64();
+            let rank = builtin_default_rank(registry, id) + val;
+            rank_target_map(id, item_ranks, file_ranks).insert(id, rank);
+        }
+    }
+}
+
+fn resolve_target_ranks(
+    registry: &crate::tag::TagRegistry,
+    actions: &[WriteAction],
+) -> (
+    rustc_hash::FxHashMap<i64, i64>,
+    rustc_hash::FxHashMap<i64, i64>,
+) {
+    let mut item_ranks = rustc_hash::FxHashMap::default();
+    let mut file_ranks = rustc_hash::FxHashMap::default();
+    for action in actions {
+        record_rank_change(registry, action, &mut item_ranks, &mut file_ranks);
+    }
+    (item_ranks, file_ranks)
+}
+
+fn determine_initial_rank(
+    item_ranks: &rustc_hash::FxHashMap<i64, i64>,
+    registry: &crate::tag::TagRegistry,
+    id: i64,
+) -> i64 {
+    if let Some(&rank) = item_ranks.get(&id) {
+        return rank;
+    }
+    builtin_default_rank(registry, id)
+}
+
+type IrInsertRow = (i64, Option<i64>, Option<String>, String, String);
+
+fn write_item_references_set(
+    store: &Store,
+    inserts: Vec<IrInsertRow>,
+    rank_updates: Vec<(i64, i64)>,
+    cascade_ids: &[i64],
+) -> Result<()> {
+    let path = store.path_for_target(TargetTable::ItemReferences);
+    let tmp = Tbl::Target;
+    sql::item_references_write(&path.to_string_lossy(), inserts, cascade_ids)
+        .create_table_as(&store.conn, tmp)?;
+    if !rank_updates.is_empty() {
+        let staging = Tbl::Item;
+        sql::rank_staging_query(rank_updates)
+            .create_table_as(&store.conn, staging)?;
+        sql::update_table_ranks(&store.conn, tmp, staging)?;
+        staging.drop_table(&store.conn)?;
+    }
+    Query::select()
+        .column(sea_query::Asterisk)
+        .from(tmp)
+        .order_by(Col::ItemId, Order::Asc)
+        .to_owned()
+        .save_parquet(&store.conn, &path)?;
+    tmp.drop_table(&store.conn)?;
+    Ok(())
+}
+
+fn write_file_and_removed_ranks_set(
+    store: &Store,
+    rank_updates: Vec<(i64, i64)>,
+) -> Result<()> {
+    for target in [TargetTable::FileReferences, TargetTable::RemovedFiles] {
+        let path = store.path_for_target(target);
+        if !path.exists() {
+            continue;
+        }
+        let tmp = Tbl::Target;
+        let staging = Tbl::Item;
+        sql::rank_staging_query(rank_updates.clone())
+            .create_table_as(&store.conn, staging)?;
+        parquet_query(&path.to_string_lossy())
+            .create_table_as(&store.conn, tmp)?;
+        sql::update_table_ranks(&store.conn, tmp, staging)?;
+        Query::select()
+            .column(sea_query::Asterisk)
+            .from(tmp)
+            .order_by(Col::ItemId, Order::Asc)
+            .to_owned()
+            .save_parquet(&store.conn, &path)?;
+        tmp.drop_table(&store.conn)?;
+        staging.drop_table(&store.conn)?;
+    }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────
 // 公開 API
 // ──────────────────────────────────────────────
 
@@ -66,8 +219,12 @@ pub fn write(
 
     // 1. Volatile/Settling → Stored 採番
     let (resolved, new_item_ids) = resolve_volatiles(store, actions)?;
-    // 2. 未実体化の組み込み型定義（Sys 区画・行なし）に kind/content を補う
+    // 2. 未実体化の組み込み型定義（Sys 区画・行なし）に kind/content/name を補う
     let resolved = inject_builtin_definitions(store, registry, resolved)?;
+    modified_types.extend(definition_partition_types(store, &resolved));
+    modified_types.retain(|t| !registry.is_excluded_from_tags(t));
+
+    let (item_ranks, file_ranks) = resolve_target_ranks(registry, &resolved);
 
     // 3. カウント
     let (updated, deleted) = {
@@ -85,7 +242,7 @@ pub fn write(
                 }
             }
         }
-        let u: usize = add.values().sum::<usize>() + new_item_ids.len();
+        let u: usize = add.values().sum::<usize>();
         let d: usize = del
             .iter()
             .map(|(id, &n)| n.saturating_sub(*add.get(id).unwrap_or(&0)))
@@ -94,7 +251,8 @@ pub fn write(
     };
 
     // 4. 変更を収集
-    let mut ir_inserts: Vec<(i64, String, String)> = vec![];
+    type IrInsertRow = (i64, Option<i64>, Option<String>, String, String);
+    let mut ir_inserts: Vec<IrInsertRow> = vec![];
     let mut ut_inserts: Vec<(i64, TypedTag)> = vec![];
     let mut ut_deletes: Vec<UserTagDelete> = vec![];
     let mut user_cascade: Vec<i64> = vec![]; // User/System item_id カスケード削除
@@ -106,6 +264,7 @@ pub fn write(
                 let item_id = item.as_i64();
                 let mut item_kind: Option<String> = None;
                 let mut content: Option<String> = None;
+                let mut name: Option<String> = None;
 
                 for op in tags {
                     let tag = match op {
@@ -118,13 +277,33 @@ pub fn write(
                         TagType::Base(SType::Content) => {
                             content = Some(tag.as_str())
                         }
+                        TagType::Base(SType::Name) => {
+                            name = Some(tag.as_str());
+                            ut_inserts.push((item_id, tag));
+                        }
                         _ => ut_inserts.push((item_id, tag)),
                     }
                 }
 
                 if item_kind.is_some() || content.is_some() {
+                    let rank =
+                        determine_initial_rank(&item_ranks, registry, item_id);
+                    let name_str = name.or_else(|| {
+                        (Origin::within(item_id) == Origin::Builtin)
+                            .then(|| {
+                                let offset = (item_id
+                                    - Origin::Builtin.block_lo())
+                                    as u32;
+                                registry
+                                    .builtin_name_for_offset(offset)
+                                    .map(|s| s.to_string())
+                            })
+                            .flatten()
+                    });
                     ir_inserts.push((
                         item_id,
+                        Some(rank),
+                        name_str,
                         item_kind.unwrap_or_default(),
                         content.unwrap_or_default(),
                     ));
@@ -161,18 +340,21 @@ pub fn write(
         }
     }
 
+    let mut seen = rustc_hash::FxHashSet::default();
+    ut_inserts.retain(|(id, tag)| {
+        seen.insert((*id, tag.tag_type().as_str().to_string(), tag.as_str()))
+    });
+
     let casts: Vec<(TagType, BiticalType)> =
         cast_migration.into_iter().collect();
 
     // 5. 書き込み（順序固定: item_references → user_tags → rank 更新）
-    if !ir_inserts.is_empty() || !user_cascade.is_empty() {
-        let path = store.path_for_target(TargetTable::ItemReferences);
-        sql::item_references_write(
-            &path.to_string_lossy(),
-            ir_inserts,
-            &user_cascade,
-        )
-        .save_parquet(&store.conn, &path)?;
+    if !ir_inserts.is_empty()
+        || !item_ranks.is_empty()
+        || !user_cascade.is_empty()
+    {
+        let updates: Vec<(i64, i64)> = item_ranks.into_iter().collect();
+        write_item_references_set(store, ir_inserts, updates, &user_cascade)?;
     }
     let all_cascade: Vec<i64> = user_cascade
         .iter()
@@ -193,6 +375,10 @@ pub fn write(
             &casts,
         )
         .save_parquet(&store.conn, &path)?;
+    }
+    if !file_ranks.is_empty() {
+        let updates: Vec<(i64, i64)> = file_ranks.into_iter().collect();
+        write_file_and_removed_ranks_set(store, updates)?;
     }
     if !file_cascade.is_empty() {
         for target in [
@@ -324,7 +510,7 @@ fn resolve_volatiles(
 // ──────────────────────────────────────────────
 
 // Sys 区画の id を持つが item_references にまだ行が無い Add に、
-// registry から導出した kind/content を補って行を作れるようにする。
+// registry から導出した kind/content/name を補って行を作れるようにする。
 // 行が既にあれば触らない（通常の rank/tag 更新に任せる）。
 fn inject_builtin_definitions(
     store: &Store,
@@ -377,7 +563,7 @@ fn inject_builtin_definitions(
 }
 
 // 指定 id のうち、既に item_references に行があるものの集合を返す。
-fn existing_item_ids(
+pub(super) fn existing_item_ids(
     store: &Store,
     ids: &[i64],
 ) -> Result<std::collections::HashSet<i64>> {

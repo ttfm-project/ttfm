@@ -21,12 +21,12 @@ _ttfm_completion() {
         case "$comp_type" in
             63|33|64)
                 case "$_TTFM_LAST_TYPE" in
-                    63|33|64) _TTFM_LAST_OFFSET=$((_TTFM_LAST_OFFSET + 10)) ;;
+                    63|33|64) _TTFM_LAST_OFFSET=$((_TTFM_LAST_OFFSET + 40)) ;;
                     *) _TTFM_LAST_OFFSET="$_TTFM_LAST_OFFSET" ;;
                 esac
                 ;;
             *)
-                _TTFM_LAST_OFFSET=$((_TTFM_LAST_OFFSET + 10))
+                _TTFM_LAST_OFFSET=$((_TTFM_LAST_OFFSET + 40))
                 ;;
         esac
     else
@@ -35,7 +35,19 @@ _ttfm_completion() {
         _TTFM_LAST_OFFSET=0
     fi
     _TTFM_LAST_TYPE="$comp_type"
-    compopt +o default +o bashdefault 2>/dev/null
-    mapfile -t COMPREPLY < <(ttfm complete --shell bash --offset "$_TTFM_LAST_OFFSET" --point "$COMP_POINT" --wordbreaks "$COMP_WORDBREAKS" -- "$COMP_LINE" 2>/dev/null)
+    local out status
+    out="$(ttfm complete --shell bash --offset "$_TTFM_LAST_OFFSET" --point "$COMP_POINT" --wordbreaks "$COMP_WORDBREAKS" -- "$COMP_LINE" 2>/dev/null)"
+    status=$?
+    if [ "$status" -eq 2 ]; then
+        compopt -o default -o bashdefault 2>/dev/null
+        COMPREPLY=()
+    else
+        compopt +o default +o bashdefault 2>/dev/null
+        if [ -n "$out" ]; then
+            mapfile -t COMPREPLY <<< "$out"
+        else
+            COMPREPLY=()
+        fi
+    fi
 }
 complete -o default -o bashdefault -o nospace -F _ttfm_completion ttfm
