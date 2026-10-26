@@ -456,21 +456,56 @@ pub fn shell_candidates(
     format_shell_replacements(&parsed.current, replacements, shell)
 }
 
+fn common_prefix<'a>(items: impl IntoIterator<Item = &'a str>) -> String {
+    let mut iter = items.into_iter();
+    let Some(first) = iter.next() else {
+        return String::new();
+    };
+    iter.fold(first.to_string(), |acc, s| {
+        acc.chars()
+            .zip(s.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| a)
+            .collect()
+    })
+}
+
+fn with_escape_safe_prefix(
+    pairs: Vec<(&str, String)>,
+    quote: ShellQuote,
+) -> Vec<String> {
+    let mut replies: Vec<String> =
+        pairs.iter().map(|(_, q)| q.clone()).collect();
+    if replies.len() < 2 {
+        return replies;
+    }
+    let unquoted_lcp = common_prefix(pairs.iter().map(|(u, _)| *u));
+    let Some(safe) = quote_for_shell(&unquoted_lcp, quote) else {
+        return replies;
+    };
+    if common_prefix(replies.iter().map(String::as_str)) != safe
+        && !replies.contains(&safe)
+    {
+        replies.insert(0, safe);
+    }
+    replies
+}
+
 fn bash_replies(word: &CurrentWord, replacements: &[String]) -> Vec<String> {
-    let replies: Vec<String> = replacements
+    let pairs: Vec<(&str, String)> = replacements
         .iter()
         .filter_map(|r| r.strip_prefix(word.text_before_rl.as_str()))
         .map(|r| match word.quote {
             ShellQuote::None => r.strip_suffix(' ').unwrap_or(r),
             _ => r,
         })
-        .filter_map(|r| quote_for_shell(r, word.quote))
+        .filter_map(|r| quote_for_shell(r, word.quote).map(|q| (r, q)))
         .collect();
-    match (replies.as_slice(), word.quote) {
-        (_, ShellQuote::None) => replies,
-        ([only], _) if *only == word.rl_text => vec![],
-        ([only], _) => vec![only.clone(), format!("{only} ")],
-        _ => replies,
+    match (pairs.as_slice(), word.quote) {
+        (_, ShellQuote::None) => with_escape_safe_prefix(pairs, word.quote),
+        ([(_, only)], _) if *only == word.rl_text => vec![],
+        ([(_, only)], _) => vec![only.clone(), format!("{only} ")],
+        _ => with_escape_safe_prefix(pairs, word.quote),
     }
 }
 
@@ -786,5 +821,46 @@ mod tests {
             cands.iter().any(|c| c.contains('%')),
             "expected % in {cands:?}"
         );
+    }
+
+    fn lcp(replies: &[String]) -> String {
+        let first = replies.first().cloned().unwrap_or_default();
+        first
+            .chars()
+            .enumerate()
+            .take_while(|(i, c)| {
+                replies.iter().all(|r| r.chars().nth(*i) == Some(*c))
+            })
+            .map(|(_, c)| c)
+            .collect()
+    }
+
+    fn unquoted_word(text: &str, before_rl: &str) -> CurrentWord {
+        CurrentWord {
+            text: text.to_string(),
+            quote: ShellQuote::None,
+            text_before_rl: before_rl.to_string(),
+            rl_text: text[before_rl.len()..].to_string(),
+        }
+    }
+
+    #[test]
+    fn test_bash_replies_common_prefix_never_ends_inside_escape() {
+        let date = bash_replies(
+            &unquoted_word("mtime:2026-10-26", "mtime:"),
+            &[
+                r#"mtime:"2026-10-26""#.to_string(),
+                r#"mtime:"2026-10-26 12:36""#.to_string(),
+                r#"mtime:"2026-10-26 12:36:15""#.to_string(),
+            ],
+        );
+        assert_eq!(lcp(&date), r#"\"2026-10-26"#);
+        assert!(date.contains(&r#"\"2026-10-26\ 12:36\""#.to_string()));
+
+        let memo = bash_replies(
+            &unquoted_word("memo:a", "memo:"),
+            &[r#"memo:"a b""#.to_string(), r#"memo:"a\"b""#.to_string()],
+        );
+        assert_eq!(lcp(&memo), r#"\"a"#);
     }
 }

@@ -2228,7 +2228,7 @@ fn test_clear_keeps_non_file_tags_dictionary() -> anyhow::Result<()> {
     assert!(store.is_indexed());
     assert_eq!(
         origin_labels(&store, Origin::File, "name"),
-        ["files", "foo.txt"]
+        ["bar.txt", "files", "foo.txt"]
     );
     assert_eq!(origin_labels(&store, Origin::User, "name"), ["foo.txt"]);
     Ok(())

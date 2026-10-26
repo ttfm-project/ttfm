@@ -22,6 +22,7 @@ use crate::cli::interactive::autocomplete::{
 use crate::cli::interactive::command::{
     dispatch_command, parse_command, print_menu,
 };
+use crate::cli::interactive::prompt_input::TerminalPromptInput;
 use crate::cli::interactive::state::State;
 use crate::config::Config;
 use crate::db::Store;
@@ -29,8 +30,8 @@ use crate::edit::WriteOptions;
 use crate::tag::TagRegistry;
 use reedline::{
     default_emacs_keybindings, ColumnarMenu, EditCommand, EditMode, Emacs,
-    FileBackedHistory, KeyCode, KeyModifiers, Menu, MenuBuilder, MenuEvent,
-    MenuSettings, Painter, PromptEditMode, Reedline, ReedlineEvent,
+    FileBackedHistory, Hinter, KeyCode, KeyModifiers, Menu, MenuBuilder,
+    MenuEvent, MenuSettings, Painter, PromptEditMode, Reedline, ReedlineEvent,
     ReedlineMenu, ReedlineRawEvent, Suggestion, UndoBehavior,
 };
 use std::io::{BufRead, BufReader, Read, Write};
@@ -842,10 +843,36 @@ impl InteractiveEditMode {
         ])
     }
 
+    fn bare_command_enter(
+        &self,
+        event: &ReedlineEvent,
+    ) -> Option<ReedlineEvent> {
+        let ReedlineEvent::UntilFound(events) = event else {
+            return None;
+        };
+        if !events.contains(&ReedlineEvent::Submit) {
+            return None;
+        }
+        let hinter = self.hinter.as_ref()?.lock().ok()?;
+        let cmd = hinter.current_line().trim_start();
+        if !matches!(cmd, "s" | "t" | "u" | "i")
+            || !hinter.complete_hint().is_empty()
+        {
+            return None;
+        }
+        Some(ReedlineEvent::Edit(vec![
+            EditCommand::Clear,
+            EditCommand::InsertString(format!("{cmd} ")),
+        ]))
+    }
+
     pub fn handle_reedline_event(
         &mut self,
         event: ReedlineEvent,
     ) -> ReedlineEvent {
+        if let Some(restored) = self.bare_command_enter(&event) {
+            return restored;
+        }
         self.clear_ghost_on_nav_or_delete(&event);
         match event {
             ReedlineEvent::Esc => match self.current_phase() {
@@ -1116,8 +1143,7 @@ pub fn run_interactive_terminal(
         }
         match parse_command(&format!("s {q}"), false) {
             Ok(cmd) => {
-                let stdin = std::io::stdin();
-                let mut stdin_lock = stdin.lock();
+                let mut prompt_input = TerminalPromptInput::default();
                 let mut path_guard = last_path.lock().unwrap();
                 if let Err(e) = dispatch_command(
                     cmd,
@@ -1127,7 +1153,7 @@ pub fn run_interactive_terminal(
                     config,
                     write_options.clone(),
                     &mut path_guard,
-                    &mut stdin_lock,
+                    &mut prompt_input,
                     &mut std::io::stdout(),
                     &mut std::io::stderr(),
                 ) {
@@ -1165,8 +1191,7 @@ pub fn run_interactive_terminal(
                     matches!(*state.lock().unwrap(), State::Searched { .. });
                 match parse_command(trimmed, is_searched) {
                     Ok(cmd) => {
-                        let stdin = std::io::stdin();
-                        let mut stdin_lock = stdin.lock();
+                        let mut prompt_input = TerminalPromptInput::default();
                         let dispatch_res = {
                             let mut state_guard = state.lock().unwrap();
                             let mut path_guard = last_path.lock().unwrap();
@@ -1178,7 +1203,7 @@ pub fn run_interactive_terminal(
                                 config,
                                 write_options.clone(),
                                 &mut path_guard,
-                                &mut stdin_lock,
+                                &mut prompt_input,
                                 &mut std::io::stdout(),
                                 &mut std::io::stderr(),
                             )
@@ -1631,5 +1656,60 @@ mod runner_state_tests {
         assert_eq!(hinter.lock().unwrap().handle_line("s", 1), " *:*");
         assert_eq!(hinter.lock().unwrap().handle_line("t", 1), "");
         assert_eq!(hinter.lock().unwrap().handle_line("u", 1), "");
+    }
+
+    #[test]
+    fn test_edit_mode_enter_on_bare_command_restores_spaced_command() {
+        let enter = build_keybindings()
+            .find_binding(
+                reedline::KeyModifiers::NONE,
+                reedline::KeyCode::Enter,
+            )
+            .unwrap();
+        for cmd in ["s", "t", "u", "i"] {
+            let hinter = Arc::new(Mutex::new(InteractiveHinter::new()));
+            hinter
+                .lock()
+                .unwrap()
+                .set_searched_query(Some("extension:md".to_string()));
+            hinter
+                .lock()
+                .unwrap()
+                .set_untag_query(Some("project:x".to_string()));
+            hinter.lock().unwrap().cancel_trace();
+            hinter.lock().unwrap().handle_line(cmd, 1);
+            let mut mode =
+                InteractiveEditMode::new(Emacs::new(build_keybindings()));
+            mode.set_hinter(Arc::clone(&hinter));
+            assert_eq!(
+                mode.handle_reedline_event(enter.clone()),
+                reedline::ReedlineEvent::Edit(vec![
+                    reedline::EditCommand::Clear,
+                    reedline::EditCommand::InsertString(format!("{cmd} ")),
+                ])
+            );
+            assert!(!hinter
+                .lock()
+                .unwrap()
+                .handle_line(&format!("{cmd} "), 2)
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn test_edit_mode_enter_with_ghost_passes_through() {
+        let enter = build_keybindings()
+            .find_binding(
+                reedline::KeyModifiers::NONE,
+                reedline::KeyCode::Enter,
+            )
+            .unwrap();
+        let hinter = Arc::new(Mutex::new(InteractiveHinter::new()));
+        hinter.lock().unwrap().set_last_query("extension:md");
+        hinter.lock().unwrap().handle_line("s", 1);
+        let mut mode =
+            InteractiveEditMode::new(Emacs::new(build_keybindings()));
+        mode.set_hinter(Arc::clone(&hinter));
+        assert_eq!(mode.handle_reedline_event(enter.clone()), enter);
     }
 }

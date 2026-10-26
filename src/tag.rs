@@ -107,6 +107,7 @@ pub trait Scan {
 // ============================================================
 
 /// タグ値の表示フォーマット定義。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayFormat {
     pub id: String,
     pub label: String,
@@ -1863,32 +1864,25 @@ impl Display for SizeFn {
     }
 }
 
-fn format_size_si(bytes: i64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
-    if bytes < 1024 {
-        return format!("{}B", bytes);
+fn format_size(bytes: i64, base: f64, units: &[&str]) -> String {
+    if (bytes as f64) < base {
+        return format!("{bytes}B");
     }
     let mut val = bytes as f64;
     let mut idx = 0;
-    while val >= 1024.0 && idx < UNITS.len() - 1 {
-        val /= 1024.0;
+    while val >= base && idx < units.len() - 1 {
+        val /= base;
         idx += 1;
     }
-    format!("{:.2}{}", val, UNITS[idx])
+    format!("{:.2}{}", val, units[idx])
+}
+
+fn format_size_si(bytes: i64) -> String {
+    format_size(bytes, 1000.0, &["B", "KB", "MB", "GB", "TB", "PB"])
 }
 
 fn format_size_binary(bytes: i64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    if bytes < 1024 {
-        return format!("{}B", bytes);
-    }
-    let mut val = bytes as f64;
-    let mut idx = 0;
-    while val >= 1024.0 && idx < UNITS.len() - 1 {
-        val /= 1024.0;
-        idx += 1;
-    }
-    format!("{:.2}{}", val, UNITS[idx])
+    format_size(bytes, 1024.0, &["B", "KiB", "MiB", "GiB", "TiB", "PiB"])
 }
 
 // --- MtimeFn ---
@@ -4619,6 +4613,16 @@ mod tests {
             reg.type_config(&crate::types::TagType::from("quota")),
             None
         );
+    }
+
+    #[test]
+    fn test_size_display_si_uses_decimal_divisor() {
+        let si = DisplayFormat::new("si", "KB / MB");
+        let binary = DisplayFormat::new("binary", "KiB / MiB");
+        assert_eq!(SizeFn.show(&Bitical::Integer(999), si.clone()), "999B");
+        assert_eq!(SizeFn.show(&Bitical::Integer(1000), si.clone()), "1.00KB");
+        assert_eq!(SizeFn.show(&Bitical::Integer(2000), si), "2.00KB");
+        assert_eq!(SizeFn.show(&Bitical::Integer(2000), binary), "1.95KiB");
     }
 }
 

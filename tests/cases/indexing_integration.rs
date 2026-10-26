@@ -895,3 +895,20 @@ fn test_indexing_uppercase_extension_stem_search() {
     assert_eq!(results_gz.len(), 1);
     assert_eq!(results_gz[0].id, gz_id);
 }
+
+#[test]
+fn clear_then_index_does_not_hand_user_tags_to_unrelated_files() {
+    let (store, registry, _d, root) = setup(&["A/a.txt", "B/b.txt"]);
+    index(&store, &registry, &[&root.join("A")]);
+    tag(&store, &registry, "filename:a.txt", "project:secret");
+    let tagged = find(&store, &registry, "filename:a.txt")[0].id;
+
+    store.clear_index().unwrap();
+    index(&store, &registry, &[&root.join("B")]);
+
+    assert_ne!(find(&store, &registry, "filename:b.txt")[0].id, tagged);
+    assert!(
+        find(&store, &registry, "project:secret & filename:b.txt").is_empty()
+    );
+    assert_eq!(find(&store, &registry, "project:secret").len(), 1);
+}

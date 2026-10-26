@@ -23,6 +23,7 @@ use crate::cli::format::{
     format_tag_result, format_untag_result, print_results_with_options,
     ColorWarningSink, FormatOptions,
 };
+use crate::cli::interactive::prompt_input::is_prompt_cancelled;
 use crate::cli::interactive::state::State;
 use crate::cli::progress::MultiStageProgressView;
 use crate::config::Config;
@@ -457,6 +458,14 @@ pub fn dispatch_command<R: BufRead, W: Write, E: Write>(
                 output,
             ) {
                 Ok(r) => r,
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(is_prompt_cancelled) =>
+                {
+                    writeln!(output, "Cancelled.")?;
+                    print_menu(output, state)?;
+                    return Ok(true);
+                }
                 Err(e) => {
                     writeln!(err_out, "Error: {e}")?;
                     state.clear();
@@ -508,6 +517,14 @@ pub fn dispatch_command<R: BufRead, W: Write, E: Write>(
                 output,
             ) {
                 Ok(r) => r,
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(is_prompt_cancelled) =>
+                {
+                    writeln!(output, "Cancelled.")?;
+                    print_menu(output, state)?;
+                    return Ok(true);
+                }
                 Err(e) => {
                     writeln!(err_out, "Error: {e}")?;
                     state.clear();
@@ -645,9 +662,14 @@ pub fn dispatch_command<R: BufRead, W: Write, E: Write>(
                 write!(output, "{prompt_msg}")?;
                 output.flush()?;
                 let mut line = String::new();
-                input.read_line(&mut line)?;
-                let ans = line.trim().to_lowercase();
-                ans == "y" || ans == "yes"
+                match input.read_line(&mut line) {
+                    Ok(_) => {
+                        let ans = line.trim().to_lowercase();
+                        ans == "y" || ans == "yes"
+                    }
+                    Err(e) if is_prompt_cancelled(&e) => false,
+                    Err(e) => return Err(e.into()),
+                }
             } else {
                 true
             };
@@ -1477,5 +1499,197 @@ mod tests {
         // Verify that strip_ansi_codes completely strips ANSI escapes
         let stripped = console::strip_ansi_codes(HELP_TEXT);
         assert!(!stripped.contains("\x1b["));
+    }
+
+    struct CancelledInput;
+
+    impl std::io::Read for CancelledInput {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other(
+                crate::cli::interactive::prompt_input::PromptCancelled,
+            ))
+        }
+    }
+
+    impl BufRead for CancelledInput {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::other(
+                crate::cli::interactive::prompt_input::PromptCancelled,
+            ))
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+
+    #[test]
+    fn test_dispatch_tag_cancelled_at_confirm_keeps_context() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        let registry = TagRegistry::with_standard();
+        Indexer::new(&store, &registry).initialize_tables().unwrap();
+        let file_path = dir.path().join("test_sample.txt");
+        std::fs::write(&file_path, "sample content").unwrap();
+        Indexer::new(&store, &registry)
+            .run_single(dir.path(), None, false)
+            .unwrap();
+        let config = Config::default();
+        let mut path = ".".to_string();
+        let mut state = State::new();
+        dispatch_command(
+            Command::Search("extension:txt".to_string()),
+            &mut state,
+            &store,
+            &registry,
+            &config,
+            WriteOptions::interactive(),
+            &mut path,
+            &mut std::io::Cursor::new(b""),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        let cont = dispatch_command(
+            Command::Tag {
+                search_query: "extension:txt".to_string(),
+                edit_query: "project:x".to_string(),
+            },
+            &mut state,
+            &store,
+            &registry,
+            &config,
+            WriteOptions::interactive(),
+            &mut path,
+            &mut CancelledInput,
+            &mut output,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(cont);
+        assert_eq!(state.last_query(), Some("extension:txt"));
+        assert!(String::from_utf8(output).unwrap().contains("Cancelled."));
+        assert!(crate::search::search_nowarn(
+            &store,
+            &registry,
+            "project:x",
+            Default::default()
+        )
+        .unwrap()
+        .results
+        .is_empty());
+    }
+
+    #[test]
+    fn test_dispatch_untag_cancelled_at_confirm_keeps_context() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        let registry = TagRegistry::with_standard();
+        Indexer::new(&store, &registry).initialize_tables().unwrap();
+        let file_path = dir.path().join("test_sample.txt");
+        std::fs::write(&file_path, "sample content").unwrap();
+        Indexer::new(&store, &registry)
+            .run_single(dir.path(), None, false)
+            .unwrap();
+        let config = Config::default();
+        let mut path = ".".to_string();
+        let mut state = State::new();
+        dispatch_command(
+            Command::Tag {
+                search_query: "extension:txt".to_string(),
+                edit_query: "project:x".to_string(),
+            },
+            &mut state,
+            &store,
+            &registry,
+            &config,
+            WriteOptions::noconfirm(),
+            &mut path,
+            &mut std::io::Cursor::new(b""),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        dispatch_command(
+            Command::Search("extension:txt".to_string()),
+            &mut state,
+            &store,
+            &registry,
+            &config,
+            WriteOptions::interactive(),
+            &mut path,
+            &mut std::io::Cursor::new(b""),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        let cont = dispatch_command(
+            Command::Untag {
+                search_query: "extension:txt".to_string(),
+                edit_query: "project:x".to_string(),
+            },
+            &mut state,
+            &store,
+            &registry,
+            &config,
+            WriteOptions::interactive(),
+            &mut path,
+            &mut CancelledInput,
+            &mut output,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(cont);
+        assert_eq!(state.last_query(), Some("extension:txt"));
+        assert!(String::from_utf8(output).unwrap().contains("Cancelled."));
+        assert_eq!(
+            crate::search::search_nowarn(
+                &store,
+                &registry,
+                "project:x",
+                Default::default()
+            )
+            .unwrap()
+            .results
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_dispatch_clear_index_cancelled_at_confirm_keeps_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        let registry = TagRegistry::with_standard();
+        Indexer::new(&store, &registry).initialize_tables().unwrap();
+        let file_path = dir.path().join("test_sample.txt");
+        std::fs::write(&file_path, "sample content").unwrap();
+        Indexer::new(&store, &registry)
+            .run_single(dir.path(), None, false)
+            .unwrap();
+        let mut output = Vec::new();
+        let cont = dispatch_command(
+            Command::ClearIndex { all: false },
+            &mut State::new(),
+            &store,
+            &registry,
+            &Config::default(),
+            WriteOptions::interactive(),
+            &mut ".".to_string(),
+            &mut CancelledInput,
+            &mut output,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(cont);
+        assert!(String::from_utf8(output).unwrap().contains("Cancelled."));
+        assert!(!crate::search::search_nowarn(
+            &store,
+            &registry,
+            "extension:txt",
+            Default::default()
+        )
+        .unwrap()
+        .results
+        .is_empty());
     }
 }

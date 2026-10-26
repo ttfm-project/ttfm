@@ -3631,6 +3631,7 @@ dependencies = [
  "chrono-english",
  "clap",
  "console",
+ "crossterm 0.29.0",
  "dateparser",
  "dirs 5.0.1",
  "duckdb",

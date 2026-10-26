@@ -218,6 +218,23 @@ fn next_serial_path(target: &Path, reserved: &HashSet<PathBuf>) -> PathBuf {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetConflict {
+    Exists,
+    Duplicate,
+}
+
+impl std::fmt::Display for TargetConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exists => write!(f, "target already exists"),
+            Self::Duplicate => {
+                write!(f, "target duplicates another target in this edit")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictChoice {
     Abort,
     Skip,
@@ -238,9 +255,14 @@ fn resolve_conflicts(
     let mut for_all_choice: Option<ConflictChoice> = None;
 
     for m in moves {
-        let exists = m.to.exists();
-        let dup = reserved.contains(&m.to);
-        if exists || dup {
+        let conflict = if m.to.exists() {
+            Some(TargetConflict::Exists)
+        } else if reserved.contains(&m.to) {
+            Some(TargetConflict::Duplicate)
+        } else {
+            None
+        };
+        if let Some(conflict) = conflict {
             let choice = match policy_override {
                 Some(ConflictPolicy::Abort) => ConflictChoice::Abort,
                 Some(ConflictPolicy::Skip) => ConflictChoice::Skip,
@@ -249,8 +271,9 @@ fn resolve_conflicts(
                 None => match for_all_choice {
                     Some(c) => c,
                     None if interactive => {
-                        let c =
-                            prompt.ask_conflict_resolution(&m.item, &m.to)?;
+                        let c = prompt.ask_conflict_resolution(
+                            &m.item, &m.to, conflict,
+                        )?;
                         if matches!(
                             c,
                             ConflictChoice::SkipAll | ConflictChoice::SerialAll
@@ -265,7 +288,7 @@ fn resolve_conflicts(
 
             match choice {
                 ConflictChoice::Abort => {
-                    bail!("target already exists: {}", m.to.display());
+                    bail!("{conflict}: {}", m.to.display());
                 }
                 ConflictChoice::Skip | ConflictChoice::SkipAll => {
                     skipped_items.insert(m.item);
@@ -488,6 +511,7 @@ pub trait ConfirmPrompt {
         &mut self,
         item: &ItemId,
         target: &Path,
+        conflict: TargetConflict,
     ) -> Result<ConflictChoice>;
     fn ask_hardlink_resolution(
         &mut self,
@@ -568,10 +592,11 @@ impl<'a, R: BufRead, W: Write> ConfirmPrompt for IoConfirmPrompt<'a, R, W> {
         &mut self,
         item: &ItemId,
         target: &Path,
+        conflict: TargetConflict,
     ) -> Result<ConflictChoice> {
         writeln!(
             self.output,
-            "Target already exists for item {item}: {}",
+            "Conflict for item {item}: {conflict}: {}",
             target.display()
         )?;
         writeln!(
@@ -953,6 +978,7 @@ mod tests {
             &mut self,
             _item: &ItemId,
             _target: &Path,
+            _conflict: TargetConflict,
         ) -> Result<ConflictChoice> {
             Ok(ConflictChoice::Abort)
         }
@@ -1219,6 +1245,7 @@ mod tests {
             &mut self,
             _: &ItemId,
             _: &Path,
+            _: TargetConflict,
         ) -> Result<ConflictChoice> {
             Ok(ConflictChoice::Abort)
         }

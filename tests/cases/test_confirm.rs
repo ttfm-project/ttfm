@@ -24,7 +24,7 @@ use ttfm::{
     edit::{
         confirm::{
             ConfirmPrompt, ConfirmSummary, ConflictChoice, HardlinkChoice,
-            ReplaceChoice,
+            ReplaceChoice, TargetConflict,
         },
         edit, edit_with_io, edit_with_prompt, QueryType, WriteOptions,
     },
@@ -115,6 +115,7 @@ impl ConfirmPrompt for MockPrompt {
         &mut self,
         _item: &ItemId,
         _target: &Path,
+        _conflict: TargetConflict,
     ) -> anyhow::Result<ConflictChoice> {
         Ok(self.conflict_answer)
     }
@@ -698,4 +699,48 @@ fn piped_stdin_without_yes_asks_confirmation() -> anyhow::Result<()> {
         run(&["search", "--short", "filename:beta.txt & status:"], "")?;
     assert!(String::from_utf8_lossy(&status.stdout).contains("ttfm"));
     Ok(())
+}
+
+#[test]
+fn relocate_target_duplicate_aborts_with_duplicate_message() {
+    let (store, registry, _d, root) = setup(&["a.txt", "b.txt"]);
+    let err = edit(
+        &store,
+        &registry,
+        "filename:a.txt | filename:b.txt",
+        Some("filename:same.txt"),
+        QueryType::Tag,
+        None,
+        WriteOptions::noconfirm(),
+        &mut Vec::new(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("duplicates another target"), "{err}");
+    assert!(!err.contains("already exists"), "{err}");
+    assert!(root.join("a.txt").exists() && root.join("b.txt").exists());
+    assert!(!root.join("same.txt").exists());
+}
+
+#[test]
+fn relocate_target_duplicate_prompt_names_duplicate() {
+    let (store, registry, _d, root) = setup(&["a.txt", "b.txt"]);
+    let mut input = Cursor::new(b"1\n".to_vec());
+    let mut output = Vec::new();
+    let _ = edit_with_io(
+        &store,
+        &registry,
+        "filename:a.txt | filename:b.txt",
+        Some("filename:same.txt"),
+        QueryType::Tag,
+        None,
+        WriteOptions::interactive(),
+        &mut Vec::new(),
+        &mut input,
+        &mut output,
+    );
+    let out = String::from_utf8(output).unwrap();
+    assert!(out.contains("duplicates another target"), "{out}");
+    assert!(!out.contains("already exists"), "{out}");
+    assert!(!root.join("same.txt").exists());
 }

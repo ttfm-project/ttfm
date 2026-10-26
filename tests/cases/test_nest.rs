@@ -87,7 +87,7 @@ define_cases! {
             assert!(has_item_tags(&res.results));
             let sub = res.results.iter().find(|r| r.raw_repr().contains("sub")).expect("sub");
             assert_eq!(get_nvalue(sub).as_deref(), Some("2048"), "raw nvalue stays untouched");
-            assert_eq!(get_nvalue_display(sub).as_deref(), Some("2.00KB"), "display nvalue is size-formatted");
+            assert_eq!(get_nvalue_display(sub).as_deref(), Some("2.05KB"), "display nvalue is size-formatted");
             Ok(())
         },
     },

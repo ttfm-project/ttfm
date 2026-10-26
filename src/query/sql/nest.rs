@@ -1456,6 +1456,42 @@ pub(super) fn nest(
                 Some(Iden::to_string(&Deduped)),
                 false,
             )
+        } else if let StorageMapping::Basic {
+            column: Col::LabelStr,
+            tag_type,
+        } = &desc.storage
+        {
+            let mut labeled_q = Query::select();
+            labeled_q
+                .distinct()
+                .column(Col::ItemId)
+                .expr_as(
+                    super::util::coalesce_label_columns_as_string(),
+                    Col::LabelStr,
+                )
+                .column(Col::Rank)
+                .from(src)
+                .and_where(Expr::col(Col::Type).eq(tag_type.as_str()))
+                .and_where(
+                    Expr::expr(super::util::coalesce_label_columns_as_string())
+                        .is_not_null(),
+                )
+                .and_where(Expr::col(Col::ItemId).in_subquery(
+                    Query::select()
+                        .column(Col::ItemId)
+                        .from(PickedIds)
+                        .to_owned(),
+                ));
+            let labeled_cte = CommonTableExpression::new()
+                .query(labeled_q)
+                .table_name(Alias::new("computed"))
+                .to_owned();
+            with_clause.cte(labeled_cte);
+            (
+                Iden::to_string(&Col::LabelStr),
+                Some("computed".to_string()),
+                false,
+            )
         } else {
             (Iden::to_string(&col_iden), None::<String>, true)
         };
@@ -1598,7 +1634,7 @@ pub(super) fn nest(
 
     let mut name_select = Query::select();
     name_select
-        .column(Col::LabelStr)
+        .expr(super::util::coalesce_label_columns_as_string())
         .from(src)
         .and_where(
             Expr::col(Col::ItemId).eq(Expr::col((TopItems, Col::ItemId))),
@@ -1956,7 +1992,7 @@ fn label_set_op_sql(
 
     let mut name_select = Query::select();
     name_select
-        .column(Col::LabelStr)
+        .expr(super::util::coalesce_label_columns_as_string())
         .from(src)
         .and_where(
             Expr::col(Col::ItemId).eq(Expr::col((TopItems, Col::ItemId))),

@@ -43,7 +43,7 @@ define_cases! {
         format_query: inject_path_scope,
         query: "sum(extension:txt & ((size: - 1000)))",
         assert: |res, _dir| {
-            assert_eq!(res.results[0].raw_repr(), "9.02KB", "sum(size: - 1000) should be 9.02KB");
+            assert_eq!(res.results[0].raw_repr(), "9.24KB", "sum(size: - 1000) should be 9.24KB");
             Ok(())
         },
     },
@@ -56,7 +56,7 @@ define_cases! {
         format_query: inject_path_scope,
         query: "sum(extension:txt & ((size: - (1000 / 2))))",
         assert: |res, _dir| {
-            assert_eq!(res.results[0].raw_repr(), "9.51KB", "sum(size: - 1000 / 2) should be 9.51KB");
+            assert_eq!(res.results[0].raw_repr(), "9.74KB", "sum(size: - 1000 / 2) should be 9.74KB");
             Ok(())
         },
     },

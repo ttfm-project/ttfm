@@ -59,6 +59,7 @@ fn source_tables(origin: Origin) -> &'static [(TargetTable, Tbl)] {
         Origin::File => &[
             (TargetTable::FileReferences, Tbl::FileReferences),
             (TargetTable::RemovedFiles, Tbl::RemovedFiles),
+            (TargetTable::UserTags, Tbl::UserTags),
         ],
         Origin::Builtin | Origin::User | Origin::Plugin => {
             &[(TargetTable::ItemReferences, Tbl::ItemReferences)]

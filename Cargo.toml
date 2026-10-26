@@ -36,6 +36,7 @@ glob = "0.3.3"
 fs4 = "1.1"
 filetime = "0.2.27"
 reedline = { version = "0.47.0", default-features = false }
+crossterm = "0.29"
 
 [dev-dependencies]
 filetime = "0.2.27"

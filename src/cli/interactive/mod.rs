@@ -17,6 +17,7 @@
 
 pub mod autocomplete;
 pub mod command;
+pub mod prompt_input;
 pub mod runner;
 pub mod state;
 pub use runner::run_interactive_stream;

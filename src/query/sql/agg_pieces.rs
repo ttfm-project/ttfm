@@ -145,7 +145,9 @@ pub(super) fn resolve_proj_operand_parts(
             StorageMapping::Basic {
                 column, tag_type, ..
             } => {
-                let col_expr = if let Some(p) = row_type {
+                let col_expr = if *column == Col::LabelStr {
+                    crate::query::sql::util::coalesce_label_columns_as_string_for_row(row_type)
+                } else if let Some(p) = row_type {
                     Expr::col((p, *column)).into()
                 } else {
                     Expr::col(*column).into()

@@ -306,18 +306,21 @@ impl InteractiveHinter {
     }
 
     fn hint_edit_query_trace(&mut self, trimmed: &str) -> Option<String> {
-        let query = match trimmed {
-            "t" => self.searched_query.as_deref(),
-            "u" => self.untag_query.as_deref(),
+        let (query, lead) = match trimmed {
+            "t" => (self.searched_query.as_deref(), " "),
+            "t " => (self.searched_query.as_deref(), ""),
+            "u" => (self.untag_query.as_deref(), " "),
+            "u " => (self.untag_query.as_deref(), ""),
             _ => return None,
-        }?;
+        };
+        let query = query?;
         if query.is_empty() {
             self.with_state_mut(|s| s.clear_ghost());
             return Some(String::new());
         }
         self.with_state_mut(|s| s.enter_ghost());
         let escaped = query.replace('"', "\\\"");
-        Some(format!(" \"{escaped}\" "))
+        Some(format!("{lead}\"{escaped}\" "))
     }
 
     fn compute_hint_suffix(&mut self, line: &str, pos: usize) -> String {
@@ -329,12 +332,19 @@ impl InteractiveHinter {
         }
         let trimmed = line.trim_start();
         if self.is_trace_cancelled() {
+            if trimmed.is_empty() {
+                self.with_state_mut(|s| s.unsuppress());
+                return String::new();
+            }
             if trimmed == "s "
                 || trimmed == "i "
                 || trimmed == "t "
                 || trimmed == "u "
             {
-                self.with_state_mut(|s| s.unsuppress());
+                self.with_state_mut(|s| {
+                    s.unsuppress();
+                    s.enter_ghost();
+                });
             } else {
                 return String::new();
             }
@@ -614,5 +624,32 @@ mod tests {
         assert_eq!(hinter.handle_line("t", 1), " \"project:alpha\" ");
         assert_eq!(hinter.handle_line("u", 1), " \"project:alpha\" ");
         assert_eq!(hinter.phase(), CompletionPhase::GhostActive);
+    }
+
+    #[test]
+    fn test_hinter_empty_line_restores_ghost_after_cancel() {
+        let mut h = InteractiveHinter::new();
+        h.set_last_query("extension:md");
+        h.handle_line("s", 1);
+        h.cancel_trace();
+        assert_eq!(h.handle_line("s", 1), "");
+        h.handle_line("", 0);
+        assert_eq!(h.handle_line("s", 1), " extension:md");
+    }
+
+    #[test]
+    fn test_hinter_spaced_command_shows_ghost_after_cancel() {
+        let mut h = InteractiveHinter::new();
+        h.set_last_query("extension:md");
+        h.set_searched_query(Some("extension:md".to_string()));
+        h.set_untag_query(Some("project:x".to_string()));
+        h.cancel_trace();
+        assert_eq!(h.handle_line("s ", 2), "extension:md");
+        h.cancel_trace();
+        assert_eq!(h.handle_line("t ", 2), "\"extension:md\" ");
+        h.cancel_trace();
+        assert_eq!(h.handle_line("u ", 2), "\"project:x\" ");
+        h.cancel_trace();
+        assert_eq!(h.handle_line("i ", 2), ".");
     }
 }
