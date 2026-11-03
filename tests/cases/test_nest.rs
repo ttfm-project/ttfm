@@ -87,7 +87,7 @@ define_cases! {
             assert!(has_item_tags(&res.results));
             let sub = res.results.iter().find(|r| r.raw_repr().contains("sub")).expect("sub");
             assert_eq!(get_nvalue(sub).as_deref(), Some("2048"), "raw nvalue stays untouched");
-            assert_eq!(get_nvalue_display(sub).as_deref(), Some("2.00KB"), "display nvalue is size-formatted");
+            assert_eq!(get_nvalue_display(sub).as_deref(), Some("2.05KB"), "display nvalue is size-formatted");
             Ok(())
         },
     },
@@ -2333,6 +2333,29 @@ define_cases! {
             Ok(())
         },
     },
+    scalar_left_label_comparison_unparenthesized_nest_right: {
+        setup: |dir| {
+            let sub = dir.join("sub");
+            std::fs::create_dir_all(&sub)?;
+            std::fs::write(dir.join("small.rs"), vec![0u8; 100])?;
+            std::fs::write(dir.join("big.rs"), vec![0u8; 60000])?;
+            std::fs::write(sub.join("big.txt"), vec![0u8; 60000])?;
+            Ok(())
+        },
+        modify: None,
+        format_query: default_scope,
+        query: "50KB :< extension: &: size:",
+        assert: |res, _dir| {
+            let mut names: Vec<String> = res
+                .results
+                .iter()
+                .flat_map(|r| r.get_all_values("filename"))
+                .collect();
+            names.sort();
+            assert_eq!(names, ["big.rs", "big.txt"]);
+            Ok(())
+        },
+    },
 }
 
 // ──────────────────────────────────────────────
@@ -2629,11 +2652,8 @@ fn test_nest_proj_proj_no_scope() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let res = search::search_nowarn(
         &store,
@@ -2658,11 +2678,8 @@ fn test_nest_proj_calc_no_scope() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let res = search::search_nowarn(
         &store,
@@ -2691,11 +2708,8 @@ fn test_label_set_op_column_storage() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     // type: の値（タグタイプ名）と parentdir: の値（パス）は交わらないため空
     let res = search::search_nowarn(
@@ -2739,11 +2753,8 @@ fn test_nest_label_grouping_sum_size() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let res = search::search_nowarn(
         &store,
@@ -2778,11 +2789,8 @@ fn test_nest_label_grouping_commutative_and_composition() -> anyhow::Result<()>
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let res1 = search::search_nowarn(
         &store,
@@ -2822,11 +2830,8 @@ fn test_nest_label_grouping_anchored_and_quoted_pattern() -> anyhow::Result<()>
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let res1 = search::search_nowarn(
         &store,
@@ -2866,11 +2871,8 @@ fn test_nest_label_grouping_unmatched_rows_excluded() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let res = search::search_nowarn(
         &store,
@@ -2898,11 +2900,8 @@ fn test_nest_label_grouping_multi_key() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let res = search::search_nowarn(
         &store,
@@ -2930,11 +2929,8 @@ fn test_nest_label_grouping_count_typed() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let res = search::search_nowarn(
         &store,
@@ -2966,11 +2962,8 @@ fn test_nest_label_grouping_multi_key_comparison() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let res = search::search_nowarn(
         &store,
@@ -3002,11 +2995,8 @@ fn test_nest_label_grouping_scalar_comparison() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let res = search::search_nowarn(
         &store,
@@ -3033,11 +3023,8 @@ fn test_label_grouping_on_user_defined_tag() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     ttfm::edit::edit(
         &store,
@@ -3084,11 +3071,8 @@ fn test_label_grouping_boundary_wildcards() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     ttfm::edit::edit(
         &store,
@@ -3127,5 +3111,53 @@ fn test_label_grouping_boundary_wildcards() -> anyhow::Result<()> {
     )?;
     assert_eq!(res_trailing_wildcard.results.len(), 2);
 
+    Ok(())
+}
+
+#[test]
+fn test_nest_rightmost_mtime_comparison_sieves_per_item() -> anyhow::Result<()>
+{
+    let dir = tempdir()?;
+    let root = dir.path();
+    for (name, unix) in [
+        ("old.rs", 1_577_836_800),
+        ("new.rs", 1_767_225_600),
+        ("new.txt", 1_767_225_600),
+    ] {
+        let path = root.join(name);
+        std::fs::write(&path, "")?;
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_unix_time(unix, 0),
+        )?;
+    }
+
+    let registry = TagRegistry::with_standard();
+    let store = ttfm::db::Store::open(&root.join(".ttfm/db"))?;
+    ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
+
+    let sorted_names = |query: &str| -> anyhow::Result<Vec<String>> {
+        let res = search::search_nowarn(
+            &store,
+            &registry,
+            query,
+            ttfm::SearchOptions::default(),
+        )?;
+        let mut names: Vec<String> =
+            res.results.iter().map(|r| r.raw_repr()).collect();
+        names.sort();
+        Ok(names)
+    };
+
+    assert_eq!(
+        sorted_names(r#"extension: &: mtime: :> "2025-01-01""#)?,
+        ["new.rs", "new.txt"]
+    );
+    assert_eq!(
+        sorted_names(r#"extension: &: mtime: :< "2025-01-01""#)?,
+        ["old.rs"]
+    );
     Ok(())
 }

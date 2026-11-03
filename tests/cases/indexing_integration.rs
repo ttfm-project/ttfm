@@ -47,7 +47,7 @@ fn setup(files: &[&str]) -> (Store, TagRegistry, TempDir, PathBuf) {
 
 fn index(store: &Store, registry: &TagRegistry, roots: &[&Path]) {
     Indexer::new(store, registry)
-        .run(roots, None::<&fn(usize)>, false)
+        .run(roots, None, false)
         .unwrap();
 }
 
@@ -671,7 +671,7 @@ fn indexing_no_roots_scans_nothing() {
 
     let empty: &[&Path] = &[];
     let count = Indexer::new(&store, &registry)
-        .run(empty, None::<&fn(usize)>, false)
+        .run(empty, None, false)
         .unwrap();
 
     assert_eq!(count, 0, "an empty root list must scan no entries");
@@ -878,4 +878,37 @@ fn test_dir_changed_skips_base_tags_and_updates_location() {
 
     let locs = find(&store, &registry, "parentdir:*dir_b");
     assert_eq!(locs.len(), 1);
+}
+
+#[test]
+fn test_indexing_uppercase_extension_stem_search() {
+    let (store, registry, _d, root) = setup(&["photo.JPG", "archive.tar.GZ"]);
+    index(&store, &registry, &[&root]);
+
+    let photo_id = find(&store, &registry, "filename:photo.JPG")[0].id;
+    let results = find(&store, &registry, "stem:photo");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, photo_id);
+
+    let gz_id = find(&store, &registry, "filename:archive.tar.GZ")[0].id;
+    let results_gz = find(&store, &registry, "stem:archive.tar");
+    assert_eq!(results_gz.len(), 1);
+    assert_eq!(results_gz[0].id, gz_id);
+}
+
+#[test]
+fn clear_then_index_does_not_hand_user_tags_to_unrelated_files() {
+    let (store, registry, _d, root) = setup(&["A/a.txt", "B/b.txt"]);
+    index(&store, &registry, &[&root.join("A")]);
+    tag(&store, &registry, "filename:a.txt", "project:secret");
+    let tagged = find(&store, &registry, "filename:a.txt")[0].id;
+
+    store.clear_index().unwrap();
+    index(&store, &registry, &[&root.join("B")]);
+
+    assert_ne!(find(&store, &registry, "filename:b.txt")[0].id, tagged);
+    assert!(
+        find(&store, &registry, "project:secret & filename:b.txt").is_empty()
+    );
+    assert_eq!(find(&store, &registry, "project:secret").len(), 1);
 }

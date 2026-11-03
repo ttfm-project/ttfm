@@ -24,17 +24,20 @@ TTFMのデータベースは以下の様式で定義される。
 - `scan_hash`: Path・Mtime・Size のhash
 - `basename_scan_hash`: filename・Mtime・Size・Inodeのhash
 
-### 1.3 `base_tags` テーブル (自動抽出タグ)
+### 1.3 `base_tags` テーブル (ファイル属性・自動抽出タグ)
 - **ファイルパス**: `.ttfm/db/base_tags.parquet`
+- 物理ファイル属性 (`size`, `mtime`, `stem`, `is_dir`, `file_id`) を事前縦持ち展開。
 - `item_id`: `file_references.item_id` への外部キー
-- `type`: タグの種類（例: `size_str`, `stem`）
+- `type`: タグの種類（例: `size`, `mtime`, `stem`, `is_dir`, `file_id` 等）
 - `label_str`, `label_int`, `label_double`, `label_bool`: タグの値（型ごとに物理カラムを持ち、適切な型で格納される）
-- ※ 内容やファイル名に依存する自動抽出タグ。ファイル移動のみ（内容不変）の場合は再抽出をスキップする。
+- `rank`: 属性・タグの優先度
+- ※ 内容やファイル実体に依存する属性・タグ。ファイル移動のみ（内容不変）の場合は再抽出をスキップする。
 
-### 1.4 `tags_by_location` テーブル (パス依存タグ)
+### 1.4 `tags_by_location` テーブル (ロケーション属性タグ)
 - **ファイルパス**: `.ttfm/db/tags_by_location.parquet`
+- 場所依存の物理属性 (`path`, `filename`, `parentdir`, `extension`) を事前縦持ち展開。
 - `item_id`: `file_references.item_id` への外部キー
-- `type`: タグの種類
+- `type`: タグの種類（例: `path`, `filename`, `parentdir`, `extension`）
 - `label_str`, `label_int`, `label_double`, `label_bool`: タグの値
 - ※ パス（ディレクトリ）に依存する自動抽出タグ。`locations` と同じタイミングで常に更新・洗い替えされる。
 
@@ -46,6 +49,24 @@ TTFMのデータベースは以下の様式で定義される。
 - `scan_hash`, `basename_scan_hash`: 復帰判定に用いる識別子
 - `path`, `size`, `mtime`, `is_dir`: 削除時点のメタデータ
 - `removed_at`: 削除を検知した日時 (epoch)
+
+### 1.6 `tags` Table
+- **ファイルパス**: `.ttfm/db/tags/origin=<origin>/type=<type>/*.parquet`（内部保存形式として origin と型による Hive パーティション分割ディレクトリを使用）
+- タグ候補の高速ルックアップ用辞書テーブル。
+- `oneview` から得られるタグのキャッシュであり、独自の意味を持たない。
+- 各行は元データの origin に置く: `user_tags` は user、`base_tags` / `tags_by_location` / `file_references` は file、他タグから導出した行は導出元の origin、未使用の登録済みタグ定義は item_id 区画の origin。
+- `origin=file` はインデックスで生成され、編集時は `.index_complete` 存在時のみ更新される。その他の origin はインデックスの有無に関係なく編集時に作成・更新される。
+- `.ttfm/db/.index_complete`: `origin=file` の有効性を示すマーカーファイル。インデックス完了時に作成され、`ttfm clear` で削除される。`Store::is_indexed()` は状態を保持せず毎回ファイルの有無を確認する。
+- 読み出し: 辞書全体を読み、`type` / `origin` で絞り込み、型・タグの重複を除去する。物理順スキャンは対象の型が 1 つの origin にのみ存在する場合に行う。
+- 定義検索の origin 判定: `origin:X` は `origin=X` に存在する値。
+- カラム構成:
+  - `type` (VARCHAR): タグ型名
+  - `label` (VARCHAR): 文字列化ラベル値
+  - `tag` (VARCHAR): `type:label` 完全文字列
+  - `item_id` (BIGINT, NULLABLE): 登録済み定義アイテムの Stored ID
+  - `rank` (BIGINT): タグ・型の優先度
+  - `is_attached` (BOOLEAN): アイテムへの実付与タグであるか（実付与は true、未付与登録定義は false）
+- 保存時のソート: `rank DESC, label ASC, item_id ASC`
 
 ## 2. Item Store (Definition Registry)
 タグの型(Type)や値(Label)の定義自体を管理するID台帳。
@@ -114,7 +135,7 @@ StorageMapping は3種:
 |---|---|---|
 | **Fixed(col)** | 専用カラム（`item_kind` / `content` 等） | 対象 item の物理テーブルの当該カラムを更新（`item_references` の `item_kind` / `content` は `item_references`） |
 | **Basic{column, tag_type}** | 汎用ラベルカラム（`label_str` / `label_int` / `label_double` / `label_bool`）＋ `type` | `user_tags` に行を追加/削除（`type` = tag_type、値を型に応じた `label_*` カラムへ） |
-| **Composite** | 他タグへ展開される論理タグ（`directory:` 等） | 直接の格納先を持たず、展開先の各タグの write へ委ねる |
+| **Composite** | 他タグへ展開される論理タグ（`directory:` 等）。定義アイテムについては、indexing時に展開先ソースと `implies()` から導出したラベルをtags tableに実体化する | 直接の格納先を持たず、展開先の各タグの write へ委ねる |
 
 - **書き込み先テーブルは origin で決まる**: ユーザー編集は常に `user_tags`（または Fixed の専用カラム）。
   `base_tags` / `tags_by_location` / `system_tags` は `ttfm index` 専管で、編集の write 対象外。
@@ -135,3 +156,4 @@ StorageMapping は3種:
 - `item_references` は保存時に `item_id ASC` でソートする
     - item idは区画毎の連続値になっているため、特定の区画にアクセスする際zone mapによる最適化が期待できる
     - 書き出し経路: `tagging::add_item` / edit の write エンジン / `rank::batch_update_rank`
+- `tags` パーティション内は `rank DESC, label ASC, item_id ASC` でソートする

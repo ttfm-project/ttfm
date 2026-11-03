@@ -1,6 +1,8 @@
 use crate::db::{Col, Tbl};
 use crate::types::{Bitical, BiticalType, TagType, TypedTag};
-use crate::util::parquet_query;
+use crate::util::{parquet_query, subquery, ExecuteSql};
+use anyhow::Result;
+use duckdb::Connection;
 use sea_query::{
     CaseStatement, Expr, Order, Query, SelectStatement, SimpleExpr, UnionType,
     UpdateStatement, Value,
@@ -39,30 +41,67 @@ pub(crate) struct UserTagDelete {
     pub(crate) value: Option<Bitical>,
 }
 
+pub(crate) fn rank_staging_query(updates: Vec<(i64, i64)>) -> SelectStatement {
+    let mut q = Query::select();
+    q.expr_as(Expr::val(None::<i64>), Col::ItemId)
+        .expr_as(Expr::val(None::<i64>), Col::Rank)
+        .and_where(Expr::val(1).eq(0));
+    if !updates.is_empty() {
+        let rows = Query::select()
+            .column(sea_query::Asterisk)
+            .from_values(updates, crate::db::Pronoun::Sub)
+            .to_owned();
+        q.union(UnionType::All, rows);
+    }
+    q
+}
+
+pub(crate) fn update_table_ranks(
+    conn: &Connection,
+    target: Tbl,
+    staging: Tbl,
+) -> Result<()> {
+    let sub = Query::select()
+        .column((staging, Col::Rank))
+        .from(staging)
+        .and_where(
+            Expr::col((staging, Col::ItemId))
+                .eq(Expr::col((target, Col::ItemId))),
+        )
+        .to_owned();
+    let in_sub = Query::select()
+        .column((staging, Col::ItemId))
+        .from(staging)
+        .to_owned();
+    let mut q = Query::update();
+    q.table(target)
+        .value(Col::Rank, subquery(sub))
+        .and_where(Expr::col((target, Col::ItemId)).in_subquery(in_sub));
+    q.execute(conn)?;
+    Ok(())
+}
+
 pub(crate) fn item_references_write(
     path: &str,
-    inserts: Vec<(i64, String, String)>,
+    inserts: Vec<(i64, Option<i64>, Option<String>, String, String)>,
     cascade_ids: &[i64],
 ) -> SelectStatement {
-    let mut q = parquet_query(path);
+    let mut q = Query::select();
+    q.column(Col::ItemId)
+        .column(Col::Rank)
+        .column(Col::Name)
+        .column(Col::ItemKind)
+        .column(Col::Content);
+    q.from_subquery(parquet_query(path), Tbl::ItemReferences);
     if !cascade_ids.is_empty() {
         q.and_where(Expr::col(Col::ItemId).is_not_in(cascade_ids.to_vec()));
     }
     if !inserts.is_empty() {
-        let rows: Vec<(i64, Option<i64>, Option<String>, String, String)> =
-            inserts
-                .into_iter()
-                .map(|(item_id, item_kind, content)| {
-                    (item_id, None, None, item_kind, content)
-                })
-                .collect();
-        q.union(
-            UnionType::All,
-            Query::select()
-                .column(sea_query::Asterisk)
-                .from_values(rows, crate::db::Pronoun::Sub)
-                .to_owned(),
-        );
+        let values = Query::select()
+            .column(sea_query::Asterisk)
+            .from_values(inserts, crate::db::Pronoun::Sub)
+            .to_owned();
+        q.union(UnionType::All, values);
     }
     q.order_by(Col::ItemId, Order::Asc);
     q
@@ -207,9 +246,9 @@ mod tests {
         make_empty_item_references(&conn, &path);
 
         let inserts = vec![
-            (1i64, "note".to_string(), "a".to_string()),
-            (2i64, "note".to_string(), "b".to_string()),
-            (3i64, "note".to_string(), "c".to_string()),
+            (1i64, None, None, "note".to_string(), "a".to_string()),
+            (2i64, None, None, "note".to_string(), "b".to_string()),
+            (3i64, None, None, "note".to_string(), "c".to_string()),
         ];
         let q = item_references_write(&path.to_string_lossy(), inserts, &[]);
         save_parquet(&conn, &q, &path, None).unwrap();
@@ -233,8 +272,14 @@ mod tests {
     #[test]
     fn item_ref_union_all_branch_count_does_not_scale_with_insert_count() {
         fn union_all_count(n: usize) -> usize {
-            let inserts: Vec<(i64, String, String)> = (0..n as i64)
-                .map(|i| (i, "note".to_string(), format!("v{i}")))
+            let inserts: Vec<(
+                i64,
+                Option<i64>,
+                Option<String>,
+                String,
+                String,
+            )> = (0..n as i64)
+                .map(|i| (i, None, None, "note".to_string(), format!("v{i}")))
                 .collect();
             let q = item_references_write("dummy_path.parquet", inserts, &[]);
             let sql = q.to_string(sea_query::PostgresQueryBuilder);

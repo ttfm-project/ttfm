@@ -173,6 +173,13 @@ impl Drop for TmpCleanupGuard {
     }
 }
 
+fn attach_store_tags_dir(
+    resolver: crate::query::lens_resolver::Resolver,
+    store: &Store,
+) -> crate::query::lens_resolver::Resolver {
+    resolver.with_store(store)
+}
+
 pub fn run_cache_worker(db_dir: PathBuf, cid: &str, query: &str) -> Result<()> {
     let cache = CacheManager::new(db_dir.join("cache"), 0);
     let cache_path = cache.path_for(cid);
@@ -210,18 +217,20 @@ pub fn run_cache_worker(db_dir: PathBuf, cid: &str, query: &str) -> Result<()> {
         reader,
         &db_dir,
     )?;
-    let parsed = if query.trim().is_empty() {
-        crate::query::ast::QueryNode::And(vec![])
-    } else {
-        crate::query::parser::parse_nowarn(query)?
-    };
+    if query.trim().is_empty() {
+        return Err(anyhow::anyhow!("Empty search query is not allowed"));
+    }
+    let parsed = crate::query::parser::parse_nowarn(query)?;
     let expanded =
         super::eval::expand_eval(parsed, &store, &registry, &mut Vec::new())?;
-    let resolver = crate::query::lens_resolver::Resolver::from_node(
-        expanded,
-        &registry,
-        &mut Vec::new(),
-    )?;
+    let resolver = attach_store_tags_dir(
+        crate::query::lens_resolver::Resolver::from_node(
+            expanded,
+            &registry,
+            &mut Vec::new(),
+        )?,
+        &store,
+    );
     let fetcher = crate::query::fetcher::Fetcher::new(&resolver, &store.conn);
     let mut metadata = HashMap::new();
     metadata.insert(META_QUERY.to_string(), query.to_string());
@@ -392,23 +401,30 @@ pub(crate) fn try_resolve_cache(
     }
     let n = options.n.unwrap_or(0);
     let offset = options.offset.unwrap_or(0);
-    let parsed = if query.trim().is_empty() {
-        crate::query::ast::QueryNode::And(vec![])
-    } else {
-        crate::query::parser::parse(query, sink)?
-    };
+    if query.trim().is_empty() {
+        return Err(anyhow::anyhow!("Empty search query is not allowed"));
+    }
+    let parsed = crate::query::parser::parse(query, sink)?;
     let expanded = super::eval::expand_eval(parsed, store, registry, sink)?;
-    let resolver = crate::query::lens_resolver::Resolver::from_node(
-        expanded, registry, sink,
-    )?
-    .with_order(&options.order);
+    let resolver = attach_store_tags_dir(
+        crate::query::lens_resolver::Resolver::from_node(
+            expanded, registry, sink,
+        )?
+        .with_order(&options.order),
+        store,
+    );
     let fetcher = crate::query::fetcher::Fetcher::new(&resolver, &store.conn);
     let src = crate::db::Src::Parquet(cache_path.to_string_lossy().to_string());
     let mut results = match fetcher.fetch_from(&src, n, offset) {
         Ok(r) => r,
         Err(_) => return Ok(None),
     };
-    super::apply_post_fetch_formatting(&mut results, &resolver, registry);
+    super::apply_post_fetch_formatting(
+        &mut results,
+        &resolver,
+        registry,
+        false,
+    );
     let has_more = n > 0 && results.len() > n;
     if has_more {
         results.truncate(n);
@@ -430,6 +446,7 @@ mod tests {
     use super::*;
     use crate::indexing::Indexer;
     use crate::search::search_nowarn;
+    use crate::types::Origin;
     use std::fs::File;
     use tempfile::tempdir;
 
@@ -540,11 +557,7 @@ mod tests {
         File::create(root.join("test.txt"))?;
 
         let (store, registry, cache) = setup(&db_dir)?;
-        Indexer::new(&store, &registry).run_single(
-            root,
-            None::<&fn(usize)>,
-            false,
-        )?;
+        Indexer::new(&store, &registry).run_single(root, None, false)?;
 
         let cid = "test-worker-cid";
         run_cache_worker(store.db_dir.clone(), cid, "extension:txt")?;
@@ -568,11 +581,7 @@ mod tests {
         std::fs::create_dir_all(db_dir.join("cache"))?;
         File::create(dir.path().join("test.txt"))?;
         let (store, registry, cache) = setup(&db_dir)?;
-        Indexer::new(&store, &registry).run_single(
-            dir.path(),
-            None::<&fn(usize)>,
-            false,
-        )?;
+        Indexer::new(&store, &registry).run_single(dir.path(), None, false)?;
         let cid = "test-handshake-cid";
         let token = "test-secret-token";
         let job_file = job_path_for(&cache.cache_dir, cid);
@@ -636,11 +645,7 @@ mod tests {
         }
 
         let (store, registry, _cache) = setup(&db_dir)?;
-        Indexer::new(&store, &registry).run_single(
-            root,
-            None::<&fn(usize)>,
-            false,
-        )?;
+        Indexer::new(&store, &registry).run_single(root, None, false)?;
 
         let query = "extension:txt";
 
@@ -716,11 +721,7 @@ mod tests {
         }
 
         let (store, registry, _cache) = setup(&db_dir)?;
-        Indexer::new(&store, &registry).run_single(
-            root,
-            None::<&fn(usize)>,
-            false,
-        )?;
+        Indexer::new(&store, &registry).run_single(root, None, false)?;
 
         let res = search_nowarn(
             &store,
@@ -756,11 +757,7 @@ mod tests {
         File::create(root.join("test.txt"))?;
 
         let (store, registry, cache) = setup(&db_dir)?;
-        Indexer::new(&store, &registry).run_single(
-            root,
-            None::<&fn(usize)>,
-            false,
-        )?;
+        Indexer::new(&store, &registry).run_single(root, None, false)?;
 
         let query = "extension:";
 
@@ -860,11 +857,7 @@ mod tests {
         File::create(root.join("test.rs"))?;
 
         let (store, registry, cache) = setup(&db_dir)?;
-        Indexer::new(&store, &registry).run_single(
-            root,
-            None::<&fn(usize)>,
-            false,
-        )?;
+        Indexer::new(&store, &registry).run_single(root, None, false)?;
 
         let query = "extension:md | extension:rs";
         let cid = "test-complex-cid";
@@ -894,6 +887,60 @@ mod tests {
         assert!(names.contains(&"readme.md".to_string()));
         assert!(names.contains(&"test.rs".to_string()));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_cache_count_uses_dictionary_and_mixed_pick_reads_stored(
+    ) -> Result<()> {
+        let dir = tempdir()?;
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir)?;
+        let (store, registry, _cache) = setup(&db_dir)?;
+        let project = store.tags_origin_dir(Origin::User).join("type=project");
+        std::fs::create_dir_all(&project)?;
+        std::fs::File::create(project.join("data.parquet"))?;
+        std::fs::File::create(store.complete_path())?;
+        let base = crate::query::lens_resolver::Resolver::new_nowarn(
+            "tag:\"project:a*\" & filename:*",
+            &registry,
+        )?;
+        let resolver = super::attach_store_tags_dir(base, &store);
+        let sql = crate::query::sql::build_fetch_sql(
+            &crate::db::Src::OneView,
+            &resolver,
+            10,
+            0,
+        )?
+        .to_string(PostgresQueryBuilder);
+        assert!(
+            sql.contains("\"stored\"") && sql.contains("project:a*"),
+            "{sql}"
+        );
+        assert!(sql.contains("oneview"), "{sql}");
+        assert!(!sql.contains("user_tags"), "{sql}");
+        assert!(
+            !sql.contains("hive_partitioning") && !sql.contains("type=project"),
+            "{sql}"
+        );
+        let fetched = crate::query::lens_resolver::Resolver::from_node(
+            crate::query::parser::parse_nowarn("count(tag:\"project:a*\")")?,
+            &registry,
+            &mut Vec::new(),
+        )?;
+        let fetched = super::attach_store_tags_dir(fetched, &store);
+        let count_sql = crate::query::sql::build_fetch_sql(
+            &crate::db::Src::OneView,
+            &fetched,
+            0,
+            0,
+        )?
+        .to_string(PostgresQueryBuilder);
+        assert!(
+            count_sql.contains("hive_partitioning")
+                || count_sql.contains("type=project"),
+            "{count_sql}"
+        );
         Ok(())
     }
 }

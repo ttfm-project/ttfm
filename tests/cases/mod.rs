@@ -123,7 +123,7 @@ macro_rules! define_cases {
                     .initialize_tables()
                     .expect("initialize_tables");
                 ttfm::indexing::Indexer::new(&store, &registry)
-                    .run_single(root.path(), None::<&fn(usize)>, false)
+                    .run_single(root.path(), None, false)
                     .expect("index_directory");
                 // 宣言的タグ指定（tags フィールド）を全ケース分集めて 1 回の write で適用
                 let tag_specs: Vec<(std::path::PathBuf, &str)> = CASES
@@ -440,6 +440,7 @@ pub(super) fn inject_path_scope(query: &str, dir: &Path) -> String {
 // ──────────────────────────────────────────────
 
 pub mod cache_paged_test;
+pub mod completion;
 pub mod identifier_test;
 pub mod indexing_integration;
 pub mod integration_tags;
@@ -454,15 +455,19 @@ mod test_chain_comparison;
 pub mod test_computation_fetching;
 pub mod test_confirm;
 pub mod test_date_regression;
+pub mod test_definition_short_bench;
 pub mod test_discrepancy;
 pub mod test_edit;
 pub mod test_errors;
 pub mod test_eval;
 pub mod test_fs_operate;
 pub mod test_glob_values;
+pub mod test_installer;
+pub mod test_interactive;
 pub mod test_item_refactoring;
 pub mod test_label_calc;
 pub mod test_literal_ops;
+pub mod test_multi_stage_indexing_progress;
 pub mod test_nest;
 pub mod test_null_propagation;
 pub mod test_optimize_sql;
@@ -474,13 +479,16 @@ pub mod test_reverse_patterns;
 pub mod test_scalar_format;
 pub mod test_search_order;
 pub mod test_search_progress;
+pub mod test_search_short;
 pub mod test_size_units;
 pub mod test_strict_grammar;
+pub mod test_terminal_width_formatting;
 pub mod test_type_definitions;
 pub mod test_typedtag_label_node;
 pub mod test_validation;
 pub mod test_validation_toplevel;
 pub mod test_volatile_typed_tags;
+pub mod test_wide_and_horizontal_paging;
 pub mod verify_search;
 pub mod verify_search_all;
 pub mod wasm_plugin_test;

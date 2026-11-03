@@ -39,15 +39,12 @@ fn test_boolean_arithmetic_ops() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&db_dir)?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        &data_dir,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(&data_dir, None, false)?;
 
     // デバッグ: 全アイテム数を確認 (実ファイル/ディレクトリのみ。インデックスルートの data は除く)
     let all_items =
-        search::search_nowarn(&store, &registry, "", Default::default())?;
+        search::search_nowarn(&store, &registry, "*:*", Default::default())?;
     let files_only: Vec<_> = all_items
         .results
         .iter()

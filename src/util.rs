@@ -73,6 +73,11 @@ pub fn save_parquet(
     Ok(())
 }
 
+/// `SelectStatement` をインライン副問合せ式 (`SimpleExpr`) に変換します。
+pub fn subquery(stmt: SelectStatement) -> SimpleExpr {
+    SimpleExpr::SubQuery(None, Box::new(stmt.into_sub_query_statement()))
+}
+
 /// 指定したテーブル（Iden）の全内容を Parquet 保存します。
 pub fn write_parquet<I: Iden + Clone + 'static>(
     conn: &Connection,
@@ -287,6 +292,21 @@ pub fn parquet_query(path: &str) -> SelectStatement {
         .to_owned()
 }
 
+pub fn hive_parquet_query(dir: &Path) -> SelectStatement {
+    use crate::db::{DuckDbFunc, Pronoun::*};
+    use sea_query::Func;
+    let glob = dir.join("*/*/*.parquet");
+    Query::select()
+        .column(sea_query::Asterisk)
+        .from_function(
+            Func::cust(DuckDbFunc::ReadParquet)
+                .arg(Expr::val(glob.to_string_lossy().to_string()))
+                .arg(Expr::cust("hive_partitioning = true")),
+            Diff,
+        )
+        .to_owned()
+}
+
 /// サイズ単位（B, KB, MB, GB, TB, PB とその別名。1024累乗）の1バイトあたり倍率。
 /// 空文字列・`B` は等倍（生バイト）。未知の単位は None。
 pub fn size_unit_multiplier(unit: &str) -> Option<i64> {
@@ -420,6 +440,38 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
         Ok(p) => p.matches(text),
         Err(_) => pattern == text,
     }
+}
+
+pub struct PathWord {
+    pub start: usize,
+    pub text: String,
+}
+
+pub fn split_path_words(s: &str) -> Vec<PathWord> {
+    let mut words = Vec::new();
+    let mut current: Option<PathWord> = None;
+    let mut in_quote = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                current.get_or_insert(PathWord {
+                    start: i,
+                    text: String::new(),
+                });
+            }
+            c if c.is_whitespace() && !in_quote => words.extend(current.take()),
+            c => current
+                .get_or_insert(PathWord {
+                    start: i,
+                    text: String::new(),
+                })
+                .text
+                .push(c),
+        }
+    }
+    words.extend(current);
+    words
 }
 
 // ========================================================

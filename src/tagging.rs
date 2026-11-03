@@ -57,6 +57,16 @@ pub fn add_item(
     temp_table.drop_table(&store.conn)?;
 
     refresh_view(store, registry)?;
+    if kind == "tag" {
+        if let Some((tag_type, _)) = content.split_once(':') {
+            crate::db::tags::update_tags_partitions(
+                store,
+                &store.conn,
+                registry,
+                &[tag_type],
+            )?;
+        }
+    }
     Ok(new_id)
 }
 

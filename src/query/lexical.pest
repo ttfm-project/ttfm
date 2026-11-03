@@ -21,3 +21,5 @@ reserved_chars = _{
 unquoted_tag_string = @{
     (escape | (!(WHITESPACE | "(" | ")" | "\"" | "'" | "=" | ">" | "<" | "," | ";" | "{" | "}") ~ ANY))+
 }
+
+item_id_literal = @{ ("Sys" | "User" | "File" | "Plg") ~ "(" ~ (ASCII_DIGIT+ | "*") ~ ")" }

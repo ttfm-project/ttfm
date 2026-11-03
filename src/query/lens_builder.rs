@@ -133,57 +133,35 @@ pub(crate) fn count_types(
     Some(stmt)
 }
 
-/// 定義枝（複数可、Or 経由で到達可能なもの）が指す定義アイテムの distinct 件数の
-/// スカラー SQL。`defs` は DefinitionRef 以外を含んではならない
-/// （split_definition_branches の構築上、常にこの前提が成り立つ）。
+/// 定義枝が指す定義アイテムの distinct 件数のスカラー SQL。
 pub(crate) fn count_definitions(
-    src: &crate::db::Src,
-    defs: &[crate::query::lens_resolver::ResolvedNode],
+    branches: &[crate::query::sql::definition::DefinitionBranch],
+    storage: &crate::query::lens_resolver::DefinitionStorage,
 ) -> sea_query::SelectStatement {
-    use crate::query::lens_resolver::ResolvedNode;
-
-    let branches = defs
-        .iter()
-        .map(|node| {
-            let ResolvedNode::DefinitionRef { def, .. } = node else {
-                unreachable!(
-                    "count_definitions: defs must only contain DefinitionRef"
-                );
-            };
-            crate::query::sql::definition::build_definition_name_sql(src, def)
-        })
-        .collect();
-    crate::query::sql::definition::build_definitions_count_sql(branches)
+    crate::query::sql::definition::build_definitions_count_sql(
+        branches.iter().map(|b| b.names_sql(storage)).collect(),
+    )
 }
 
-/// 定義枝（単体または Or 経由で到達可能なもの）を fetch 結果に加える統合 SQL。
-/// 各定義枝の SQL と src 由来枝の fetch（`rest_fetch`、列順は
-/// 定義枝の SQL に揃えたもの）を束ね、並び替え（`orders` が空なら既定）と
-/// limit/offset を結合後に適用する。`defs` は DefinitionRef 以外を含んではならない。
+/// 定義枝を fetch 結果に加える統合 SQL。
+/// 各定義枝の SQL とアイテム fetch（列順は定義枝の SQL に揃えたもの）を束ね、
+/// 並び替え（`orders` が空なら既定）と limit/offset を結合後に適用する。
 pub(crate) fn add_definitions(
     src: &crate::db::Src,
-    defs: &[&crate::query::lens_resolver::ResolvedNode],
-    rest_fetch: Option<sea_query::SelectStatement>,
+    branches: &[crate::query::sql::definition::DefinitionBranch],
+    items_fetch: Option<sea_query::SelectStatement>,
     n: usize,
     offset: usize,
     orders: &[crate::query::lens_resolver::ResolvedOrder],
-) -> anyhow::Result<sea_query::SelectStatement> {
-    use crate::query::lens_resolver::ResolvedNode;
-
-    let mut branches = Vec::with_capacity(defs.len() + 1);
-    for node in defs {
-        let ResolvedNode::DefinitionRef { def, .. } = node else {
-            anyhow::bail!(
-                "add_definitions: DefinitionRef 以外の枝: {:?}",
-                node
-            );
-        };
-        branches.push(
-            crate::query::sql::definition::build_definition_fetch_sql(src, def),
-        );
-    }
-    branches.extend(rest_fetch);
-    Ok(crate::query::sql::definition::build_add_definitions_sql(
-        src, branches, orders, n, offset,
-    ))
+    storage: &crate::query::lens_resolver::DefinitionStorage,
+    short: bool,
+) -> sea_query::SelectStatement {
+    let mut sqls: Vec<sea_query::SelectStatement> = branches
+        .iter()
+        .map(|b| b.fetch_sql(src, storage, short))
+        .collect();
+    sqls.extend(items_fetch);
+    crate::query::sql::definition::build_add_definitions_sql(
+        src, sqls, orders, n, offset,
+    )
 }

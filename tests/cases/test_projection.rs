@@ -15,7 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::cases::has_item_tags;
+use crate::cases::{get_nvalue, has_item_tags};
 use std::fs::File;
 use tempfile::tempdir;
 use ttfm::types::ItemId;
@@ -38,11 +38,8 @@ fn test_projection_no_empty_labels() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&db_dir)?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let res = search::search_nowarn(
         &store,
@@ -210,6 +207,57 @@ define_cases! {
             Ok(())
         },
     },
+    test_projection_name_includes_numeric_label: {
+        setup: |dir| {
+            std::fs::write(dir.join("a.txt"), b"a")?;
+            std::fs::write(dir.join("b.txt"), b"b")?;
+            Ok(())
+        },
+        tags: &[("a.txt", "name:42"), ("b.txt", "name:abc")],
+        query: "extension:txt & name:",
+        assert: |res, _dir| {
+            let mut labels: Vec<String> = res.results.iter().map(|r| r.raw_repr()).collect();
+            labels.sort();
+            assert_eq!(labels, ["42", "abc"]);
+            Ok(())
+        },
+    },
+    test_projection_item_list_shows_numeric_name: {
+        setup: |dir| {
+            std::fs::write(dir.join("a.txt"), b"a")?;
+            std::fs::write(dir.join("b.txt"), b"b")?;
+            Ok(())
+        },
+        tags: &[("a.txt", "name:42 project:p"), ("b.txt", "name:abc project:p")],
+        query: "project:",
+        assert: |res, _dir| {
+            let items: Vec<String> = res.results.iter()
+                .flat_map(|r| r.tags.entries.iter())
+                .filter(|e| e.typed_tag.tag_type() == ttfm::types::TagType::from("item"))
+                .map(|e| e.typed_tag.as_str().to_string())
+                .collect();
+            assert!(items.iter().any(|i| i.starts_with("42#")), "{items:?}");
+            assert!(!items.iter().any(|i| i.starts_with("unknown#")), "{items:?}");
+            Ok(())
+        },
+    },
+    test_projection_nest_shows_numeric_name: {
+        setup: |dir| {
+            std::fs::write(dir.join("a.txt"), b"a")?;
+            std::fs::write(dir.join("b.txt"), b"b")?;
+            Ok(())
+        },
+        tags: &[("a.txt", "name:42"), ("b.txt", "name:abc")],
+        query: "extension:txt & name: &: count(extension:txt)",
+        assert: |res, _dir| {
+            let mut labels: Vec<String> = res.results.iter().map(|r| r.raw_repr()).collect();
+            labels.sort();
+            assert_eq!(labels, ["42", "abc"]);
+            let r42 = res.results.iter().find(|r| r.raw_repr() == "42").unwrap();
+            assert_eq!(get_nvalue(r42).as_deref(), Some("1"));
+            Ok(())
+        },
+    },
 }
 
 // ──────────────────────────────────────────────
@@ -233,7 +281,7 @@ fn test_projection_queries() {
         .initialize_tables()
         .unwrap();
     ttfm::indexing::Indexer::new(&store, &registry)
-        .run_single(root, None::<&fn(usize)>, false)
+        .run_single(root, None, false)
         .unwrap();
 
     // 1. extension: (投影 - 転置: Label → Items)
@@ -486,7 +534,7 @@ fn test_projection_returns_label_volatile_items() {
         .initialize_tables()
         .unwrap();
     ttfm::indexing::Indexer::new(&store, &registry)
-        .run_single(root, None::<&fn(usize)>, false)
+        .run_single(root, None, false)
         .unwrap();
 
     // extension: で投影
@@ -615,11 +663,8 @@ fn test_scan_hash_is_treated_as_unregistered_tag() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&db_dir)?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let results = search::search_nowarn(
         &store,
@@ -649,11 +694,8 @@ fn test_label_set_op_includes_fixed_attributes() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&db_dir)?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let results = search::search_nowarn(
         &store,
@@ -693,11 +735,8 @@ fn test_count_type_matches_bare_type_projection() -> anyhow::Result<()> {
     let registry = ttfm::tag::TagRegistry::with_standard();
     let store = ttfm::db::Store::open(&db_dir)?;
     ttfm::indexing::Indexer::new(&store, &registry).initialize_tables()?;
-    ttfm::indexing::Indexer::new(&store, &registry).run_single(
-        root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    ttfm::indexing::Indexer::new(&store, &registry)
+        .run_single(root, None, false)?;
 
     let bare_results =
         search::search_nowarn(&store, &registry, "type:", Default::default())?;

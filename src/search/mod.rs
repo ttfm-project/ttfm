@@ -21,7 +21,7 @@ pub mod eval;
 pub use cache::*;
 pub use eval::*;
 
-use crate::db::{Store, TargetTable};
+use crate::db::Store;
 use crate::response::SearchResponse;
 use crate::tag::TagRegistry;
 use anyhow::Result;
@@ -40,6 +40,8 @@ pub struct SearchOptions {
     /// 明示的な並び順（複数キー可）。空なら resolve 済みクエリからの判定、
     /// それも無ければ既定（rank 降順）にフォールバックする。
     pub order: Vec<crate::types::Order>,
+    /// 高速・最小情報取得（タグ列刈り取り、キャッシュ非同期生成スキップ）
+    pub short: bool,
 }
 
 impl Default for SearchOptions {
@@ -50,6 +52,7 @@ impl Default for SearchOptions {
             cid: None,
             cache: true,
             order: Vec::new(),
+            short: false,
         }
     }
 }
@@ -65,18 +68,12 @@ pub fn search(
     options: SearchOptions,
     sink: &mut dyn crate::query::error::WarningSink,
 ) -> Result<SearchResponse> {
-    if !store.path_for_target(TargetTable::FileReferences).exists() {
-        return Err(anyhow::anyhow!(
-            "Index not found. Please run 'index' command first."
-        ));
-    }
-
     let n = options.n.unwrap_or(0);
     let offset = options.offset.unwrap_or(0);
 
-    // キャッシュ無効パス。cache:false、または「全件(n=0)かつ読み込む cid も無い」場合。
+    // キャッシュ無効パス。short:true、cache:false、または「全件(n=0)かつ読み込む cid も無い」場合。
     // cid があれば n に関わらずキャッシュ読みを試みる（下の有効パスへ）。
-    if !options.cache || (n == 0 && options.cid.is_none()) {
+    if options.short || !options.cache || (n == 0 && options.cid.is_none()) {
         let (results, has_more) = search_core(
             store,
             registry,
@@ -85,6 +82,7 @@ pub fn search(
             offset,
             &options.order,
             sink,
+            options.short,
         )?;
         return Ok(SearchResponse::from_results(
             results, None, has_more, n, offset, query,
@@ -100,8 +98,16 @@ pub fn search(
         return Ok(res);
     }
 
-    let (results, has_more) =
-        search_core(store, registry, query, n, offset, &options.order, sink)?;
+    let (results, has_more) = search_core(
+        store,
+        registry,
+        query,
+        n,
+        offset,
+        &options.order,
+        sink,
+        options.short,
+    )?;
 
     let is_generating = options
         .cid
@@ -140,10 +146,24 @@ pub fn search_nowarn(
     search(store, registry, query, options, &mut discard)
 }
 
+pub fn search_short(
+    store: &Store,
+    registry: &TagRegistry,
+    query: &str,
+    mut options: SearchOptions,
+    sink: &mut dyn crate::query::error::WarningSink,
+) -> Result<SearchResponse> {
+    options.short = true;
+    options.cache = false;
+    options.cid = None;
+    search(store, registry, query, options, sink)
+}
+
 pub(crate) fn apply_post_fetch_formatting(
     results: &mut [crate::response::Item],
     resolver: &crate::query::lens_resolver::Resolver,
     registry: &TagRegistry,
+    short: bool,
 ) {
     if let Some(tt) = resolver.get_scalar_result_label_type() {
         use crate::types::{Bitical, Origin, SType, TypedTag};
@@ -155,17 +175,20 @@ pub(crate) fn apply_post_fetch_formatting(
                 .find(|e| e.typed_tag.tag_type().as_str() == "value")
                 .and_then(|e| match e.typed_tag.value() {
                     Bitical::Integer(i) => Some(i.to_string()),
-                    Bitical::Double(d) => Some((d as i64).to_string()),
+                    Bitical::Double(d) => Some(d.to_string()),
                     _ => None,
                 });
             if let Some(raw) = raw {
-                let formatted = registry.format_display(tt.as_str(), &raw);
+                let val = if short {
+                    raw
+                } else {
+                    registry.format_display(tt.as_str(), &raw)
+                };
                 result.representative =
-                    vec![TypedTag::new(SType::Name, formatted.clone())].into();
-                result.tags.push(
-                    TypedTag::new(SType::Name, formatted),
-                    Origin::Builtin,
-                );
+                    vec![TypedTag::new(SType::Name, val.clone())].into();
+                result
+                    .tags
+                    .push(TypedTag::new(SType::Name, val), Origin::Builtin);
             }
         }
     }
@@ -179,14 +202,32 @@ pub(crate) fn apply_post_fetch_formatting(
             .find(|e| e.typed_tag.tag_type().as_str() == "nvalue")
             .map(|e| e.typed_tag.as_str())
         {
-            let display = nvalue_tag_type
-                .as_ref()
-                .map(|tt| registry.format_display(tt.as_str(), &raw))
-                .unwrap_or(raw);
+            let display = if short {
+                raw
+            } else {
+                nvalue_tag_type
+                    .as_ref()
+                    .map(|tt| registry.format_display(tt.as_str(), &raw))
+                    .unwrap_or(raw)
+            };
             result.representative.nvalue =
                 Some(crate::types::Label::from(display));
         }
     }
+}
+
+fn resolve(
+    store: &Store,
+    registry: &TagRegistry,
+    query: &str,
+    sink: &mut dyn crate::query::error::WarningSink,
+) -> Result<crate::query::lens_resolver::Resolver> {
+    let parsed = crate::query::parser::parse(query, sink)?;
+    let expanded = eval::expand_eval(parsed, store, registry, sink)?;
+    Ok(crate::query::lens_resolver::Resolver::from_node(
+        expanded, registry, sink,
+    )?
+    .with_store(store))
 }
 
 /// 検索のコア処理。resolver 生成・fetch・スカラー表示整形・ページングを行う。
@@ -199,21 +240,18 @@ pub(crate) fn search_core(
     offset: usize,
     order: &[crate::types::Order],
     sink: &mut dyn crate::query::error::WarningSink,
+    short: bool,
 ) -> Result<(Vec<crate::response::Item>, bool)> {
-    let parsed = if query.trim().is_empty() {
-        crate::query::ast::QueryNode::And(vec![])
-    } else {
-        crate::query::parser::parse(query, sink)?
-    };
-    let expanded = eval::expand_eval(parsed, store, registry, sink)?;
-    let resolver = crate::query::lens_resolver::Resolver::from_node(
-        expanded, registry, sink,
-    )?
-    .with_order(order);
+    if query.trim().is_empty() {
+        return Err(anyhow::anyhow!("Empty search query is not allowed"));
+    }
+    let resolver = resolve(store, registry, query, sink)?
+        .with_order(order)
+        .with_short(short);
     let fetcher = crate::query::fetcher::Fetcher::new(&resolver, &store.conn);
 
     let mut results = fetcher.fetch(n, offset)?;
-    apply_post_fetch_formatting(&mut results, &resolver, registry);
+    apply_post_fetch_formatting(&mut results, &resolver, registry, short);
 
     let has_more = n > 0 && results.len() > n;
     if has_more {
@@ -221,6 +259,14 @@ pub(crate) fn search_core(
     }
 
     Ok((results, has_more))
+}
+
+pub fn returns_items(
+    store: &Store,
+    registry: &TagRegistry,
+    query: &str,
+) -> Result<bool> {
+    Ok(resolve(store, registry, query, &mut Vec::new())?.returns_items())
 }
 
 #[cfg(test)]
@@ -242,16 +288,38 @@ mod tests {
     }
 
     #[test]
+    fn returns_items_only_for_item_selecting_queries() -> Result<()> {
+        let dir = tempdir()?;
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir(&db_dir)?;
+        let (store, registry, _cache) = setup(&db_dir)?;
+        for q in [
+            "*:*",
+            "extension:rs",
+            "type:*",
+            "parentdir: &: count() :> 1",
+        ] {
+            assert!(returns_items(&store, &registry, q)?, "{q}");
+        }
+        for q in [
+            "extension:",
+            "parentdir: &: count()",
+            "count(filename:)",
+            "count(filename:) > 1",
+            "extension: | parentdir:",
+        ] {
+            assert!(!returns_items(&store, &registry, q)?, "{q}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_search_forwards_warnings_to_caller_sink() -> Result<()> {
         let dir = tempdir()?;
         let db_dir = dir.path().join("db");
         std::fs::create_dir(&db_dir)?;
         let (store, registry, _cache) = setup(&db_dir)?;
-        Indexer::new(&store, &registry).run_single(
-            dir.path(),
-            None::<&fn(usize)>,
-            false,
-        )?;
+        Indexer::new(&store, &registry).run_single(dir.path(), None, false)?;
 
         let mut warnings: Vec<crate::query::error::Warning> = Vec::new();
         search(
@@ -286,11 +354,7 @@ mod tests {
         }
 
         let (store, registry, _cache) = setup(&db_dir)?;
-        Indexer::new(&store, &registry).run_single(
-            root,
-            None::<&fn(usize)>,
-            false,
-        )?;
+        Indexer::new(&store, &registry).run_single(root, None, false)?;
 
         let res = search_nowarn(
             &store,
@@ -318,11 +382,7 @@ mod tests {
 
         File::create(root.join("a.txt"))?;
         let (store, registry, _cache) = setup(&db_dir)?;
-        Indexer::new(&store, &registry).run_single(
-            root,
-            None::<&fn(usize)>,
-            false,
-        )?;
+        Indexer::new(&store, &registry).run_single(root, None, false)?;
 
         let res = search_nowarn(
             &store,
@@ -354,11 +414,7 @@ mod tests {
         std::fs::write(&path, vec![0u8; 123])?;
 
         let (store, registry, _cache) = setup(&db_dir)?;
-        Indexer::new(&store, &registry).run_single(
-            root,
-            None::<&fn(usize)>,
-            false,
-        )?;
+        Indexer::new(&store, &registry).run_single(root, None, false)?;
 
         let res = search_nowarn(
             &store,
@@ -391,5 +447,64 @@ mod tests {
         assert_eq!(res.cid, None);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_search_core_short_bypasses_cache_generation() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path();
+        let db_dir = root.join("db");
+        std::fs::create_dir(&db_dir)?;
+        File::create(root.join("test1.txt"))?;
+        File::create(root.join("test2.txt"))?;
+        let (store, registry, cache) = setup(&db_dir)?;
+        Indexer::new(&store, &registry).run_single(root, None, false)?;
+
+        let mut warnings: Vec<crate::query::error::Warning> = Vec::new();
+        let options = SearchOptions {
+            short: true,
+            n: Some(1),
+            ..Default::default()
+        };
+        let resp =
+            search(&store, &registry, "extension:txt", options, &mut warnings)?;
+        assert!(resp.cid.is_none());
+        let entries = std::fs::read_dir(cache.cache_dir())?.count();
+        assert_eq!(entries, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_post_fetch_formatting_preserves_double_decimals() {
+        use crate::response::Item;
+        use crate::types::{
+            Bitical, Intrinsic, ItemId, ItemKind, Origin, TagEntry, Tags,
+            TypedTag,
+        };
+        let mut results = vec![Item {
+            id: ItemId::Volatile(0),
+            item_kind: ItemKind::Volatile,
+            representative: vec![].into(),
+            rank: 0,
+            intrinsic: Intrinsic::default(),
+            tags: Tags {
+                entries: vec![TagEntry {
+                    typed_tag: TypedTag::new("value", Bitical::Double(222.5)),
+                    origin: Origin::User,
+                }],
+            },
+            item_count: None,
+        }];
+        let registry = TagRegistry::with_standard();
+        let resolver = crate::query::lens_resolver::Resolver::new_nowarn(
+            "avg(size:)",
+            &registry,
+        )
+        .unwrap();
+        apply_post_fetch_formatting(&mut results, &resolver, &registry, true);
+        assert_eq!(
+            results[0].representative.tags[0].value(),
+            Bitical::String("222.5".into())
+        );
     }
 }

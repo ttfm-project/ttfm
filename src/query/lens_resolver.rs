@@ -43,11 +43,18 @@ use crate::query::lens_schema::{
     definition_candidates, definition_reserved_names, Lens, StorageMapping,
 };
 use crate::query::logical_schema::LogicalSchema;
-use crate::query::sql::definition::ResolvedDefinition;
-use crate::types::{Bitical, ItemKind, Label, Origin, Rank, SType, TagType};
+use crate::query::sql::definition::{
+    DefinitionBranch, NameFilter, ResolvedDefinition,
+};
+use crate::types::{
+    Bitical, ItemKind, Label, Origin, Rank, SType, TagType, TypedTag,
+};
 use anyhow::{bail, Result};
 use duckdb::types::Value;
-use sea_query::{BinOper, Condition, Expr, SimpleExpr};
+use sea_query::{BinOper, Condition, Expr, SelectStatement, SimpleExpr};
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+use strum::IntoEnumIterator;
 
 /// 物理マッピングが解決された後のクエリノード。
 #[derive(Debug, Clone, PartialEq)]
@@ -786,50 +793,132 @@ impl ResolvedNode {
         self.get_projection().is_some() || self.has_definition_branch()
     }
 
-    /// ルートから Or だけを辿って DefinitionRef 枝に到達できるか。
-    fn has_definition_branch(&self) -> bool {
+    pub fn is_pure_definition(&self) -> bool {
         match self {
             ResolvedNode::DefinitionRef { .. } => true,
-            ResolvedNode::Or(nodes) => {
-                nodes.iter().any(|n| n.has_definition_branch())
+            ResolvedNode::Or(nodes) | ResolvedNode::And(nodes) => {
+                !nodes.is_empty()
+                    && nodes.iter().all(|n| n.is_pure_definition())
+            }
+            ResolvedNode::Difference(l, r) => {
+                l.is_pure_definition() && r.is_pure_definition()
             }
             _ => false,
         }
     }
 
-    /// ルートから Or だけで到達可能な DefinitionRef 枝と、それ以外の枝に
-    /// 分割する。定義枝を含まない場合は None。
-    /// 残りの枝は単一なら元のノード、複数なら Or として返す。
-    pub fn split_definition_branches(
+    pub(crate) fn has_definition_branch(&self) -> bool {
+        self.is_pure_definition() || !self.definition_branches(true).is_empty()
+    }
+
+    pub(crate) fn definition_branches(
         &self,
-    ) -> Option<(Vec<&ResolvedNode>, Option<ResolvedNode>)> {
-        fn walk<'a>(
-            node: &'a ResolvedNode,
-            defs: &mut Vec<&'a ResolvedNode>,
-            rest: &mut Vec<ResolvedNode>,
-        ) {
-            match node {
-                ResolvedNode::Or(nodes) => {
-                    for child in nodes {
-                        walk(child, defs, rest);
-                    }
-                }
-                ResolvedNode::DefinitionRef { .. } => defs.push(node),
-                other => rest.push(other.clone()),
+        unregistered_only: bool,
+    ) -> Vec<DefinitionBranch> {
+        match self {
+            ResolvedNode::DefinitionRef { def, .. } => {
+                vec![DefinitionBranch::new(if unregistered_only {
+                    def.unregistered()
+                } else {
+                    def.clone()
+                })]
             }
+            ResolvedNode::Or(nodes) => nodes
+                .iter()
+                .flat_map(|n| n.definition_branches(unregistered_only))
+                .collect(),
+            ResolvedNode::And(nodes) => {
+                let per_node: Vec<Vec<DefinitionBranch>> = nodes
+                    .iter()
+                    .map(|n| n.definition_branches(unregistered_only))
+                    .collect();
+                if per_node.iter().any(Vec::is_empty) {
+                    return Vec::new();
+                }
+                let Some((first, others)) = per_node.split_first() else {
+                    return Vec::new();
+                };
+                first
+                    .iter()
+                    .map(|b| {
+                        others.iter().fold(b.clone(), |b, o| {
+                            b.filtered(NameFilter::In(o.clone()))
+                        })
+                    })
+                    .collect()
+            }
+            ResolvedNode::Difference(l, r) => {
+                let right = r.definition_branches(unregistered_only);
+                l.definition_branches(unregistered_only)
+                    .into_iter()
+                    .map(|b| {
+                        if right.is_empty() {
+                            b
+                        } else {
+                            b.filtered(NameFilter::NotIn(right.clone()))
+                        }
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
         }
-        let mut defs = Vec::new();
-        let mut rest = Vec::new();
-        walk(self, &mut defs, &mut rest);
-        if defs.is_empty() {
-            return None;
-        }
-        let rest_node = match rest.len() {
-            0 => None,
-            1 => rest.pop(),
-            _ => Some(ResolvedNode::Or(rest)),
+    }
+
+    pub(crate) fn without_unregistered_definitions(&self) -> Cow<'_, Self> {
+        let ResolvedNode::Or(nodes) = self else {
+            return Cow::Borrowed(self);
         };
-        Some((defs, rest_node))
+        let mut kept: Vec<ResolvedNode> = nodes
+            .iter()
+            .filter(|n| {
+                !matches!(n, ResolvedNode::DefinitionRef { def, .. } if !def.recorded)
+            })
+            .cloned()
+            .collect();
+        match kept.len() {
+            0 => Cow::Borrowed(self),
+            n if n == nodes.len() => Cow::Borrowed(self),
+            1 => Cow::Owned(kept.remove(0)),
+            _ => Cow::Owned(ResolvedNode::Or(kept)),
+        }
+    }
+
+    pub(crate) fn is_boolean_only(&self) -> bool {
+        match self {
+            ResolvedNode::AggregationMatch { .. }
+            | ResolvedNode::AggregationAggregationMatch { .. }
+            | ResolvedNode::AggregationCalculationMatch { .. }
+            | ResolvedNode::AggregationTagMatch { .. }
+            | ResolvedNode::ScalarMatch { .. } => true,
+            ResolvedNode::CalculationMatch { calc, .. } => !calc.contains_tag(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_scalar(&self) -> bool {
+        match self {
+            ResolvedNode::Aggregation(_)
+            | ResolvedNode::AggregationMatch { .. }
+            | ResolvedNode::AggregationAggregationMatch { .. }
+            | ResolvedNode::AggregationCalculationMatch { .. }
+            | ResolvedNode::AggregationTagMatch { .. }
+            | ResolvedNode::ScalarMatch { .. }
+            | ResolvedNode::NestMatch { .. }
+            | ResolvedNode::MergedNestMatch { .. } => true,
+            ResolvedNode::Nest { keys, .. } => keys.first().is_some_and(|k| {
+                k.contains_aggregation() || k.is_pure_scalar()
+            }),
+            ResolvedNode::CalculationMatch { calc, .. } => !calc.contains_tag(),
+            ResolvedNode::NestNestMatch {
+                op: NestMatchOp::Comparison(_),
+                right_nvalue: ResolvedOperand::Literal(_),
+                ..
+            } => true,
+            ResolvedNode::And(nodes) | ResolvedNode::Or(nodes) => {
+                !nodes.is_empty() && nodes.iter().all(|n| n.is_boolean_only())
+            }
+            _ => false,
+        }
     }
 
     /// Or が異なるタグ型のオペランドを混在させる「混在投影」クエリかどうかを返します。
@@ -1167,6 +1256,24 @@ fn get_nest_keys_len(node: &ResolvedNode) -> Option<usize> {
     }
 }
 
+fn single_nest_projection(
+    node: &ResolvedNode,
+) -> Option<(TagType, Option<&ResolvedNode>)> {
+    match node {
+        ResolvedNode::Nest {
+            keys,
+            nvalue: None,
+            context,
+        } if keys.len() == 1 => {
+            Some((extract_tag_type_from_operand(&keys[0])?, context.as_deref()))
+        }
+        ResolvedNode::And(nodes) => {
+            nodes.iter().find_map(single_nest_projection)
+        }
+        _ => None,
+    }
+}
+
 /// ResolvedOperand から再帰的に最初の TagRef の TagType を抽出するヘルパー
 fn extract_tag_type_from_operand(op: &ResolvedOperand) -> Option<TagType> {
     match op {
@@ -1449,34 +1556,24 @@ pub(crate) fn resolve_query_node(
 ) -> Result<ResolvedNode> {
     match node {
         QueryNode::TypedTag(tt) => {
-            if let Some(kind) = lens.item_kind(&tt.tag_type()) {
-                let (operand, candidates, reserved, default_rank) =
-                    definition_context(
+            if tt.is_all_items_wildcard() {
+                let items = resolve_query_node(lens, typed_tag_inner(&tt)?)?;
+                return Ok(ResolvedNode::Or(vec![
+                    items,
+                    unregistered_definition_ref(
                         lens,
-                        &tt.tag_type(),
-                        &tt.value().as_display_name(),
-                        kind,
-                        &[],
-                    )?;
-                return Ok(ResolvedNode::DefinitionRef {
-                    def: ResolvedDefinition::for_tag(
-                        kind,
-                        tt,
-                        candidates,
-                        reserved,
-                        default_rank,
-                    ),
-                    operand,
-                });
+                        TypedTag::new(SType::Type, "*"),
+                    )?,
+                    unregistered_definition_ref(
+                        lens,
+                        TypedTag::new(SType::TypedTag, "*"),
+                    )?,
+                ]));
             }
-            let inner = match tt.node().into_owned() {
-                crate::query::Node::Query(qn)
-                | crate::query::Node::Expanded(qn) => *qn,
-                crate::query::Node::Resolved(_) => {
-                    bail!("TypedTag's Node must not already be Resolved before lens resolution")
-                }
-            };
-            resolve_query_node(lens, inner)
+            if let Some(kind) = lens.item_kind(&tt.tag_type()) {
+                return definition_ref(lens, tt, kind);
+            }
+            resolve_query_node(lens, typed_tag_inner(&tt)?)
         }
         QueryNode::ColumnMatch { tag, label } => {
             let tag_type = TagType::Base(tag);
@@ -1643,6 +1740,59 @@ pub(crate) fn resolve_query_node(
     }
 }
 
+fn typed_tag_inner(tt: &TypedTag) -> Result<QueryNode> {
+    match tt.node().into_owned() {
+        crate::query::Node::Query(qn) | crate::query::Node::Expanded(qn) => {
+            Ok(*qn)
+        }
+        crate::query::Node::Resolved(_) => bail!(
+            "TypedTag's Node must not already be Resolved before lens resolution"
+        ),
+    }
+}
+
+fn definition_ref(
+    lens: &Lens,
+    tt: TypedTag,
+    kind: ItemKind,
+) -> Result<ResolvedNode> {
+    let (operand, candidates, reserved, default_rank) = definition_context(
+        lens,
+        &tt.tag_type(),
+        &tt.value().as_display_name(),
+        kind,
+        &[],
+    )?;
+    Ok(ResolvedNode::DefinitionRef {
+        def: ResolvedDefinition::for_tag(
+            kind,
+            tt,
+            candidates,
+            reserved,
+            default_rank,
+        ),
+        operand,
+    })
+}
+
+fn unregistered_definition_ref(
+    lens: &Lens,
+    tt: TypedTag,
+) -> Result<ResolvedNode> {
+    let kind = lens
+        .item_kind(&tt.tag_type())
+        .expect("type and tag are definition types");
+    let ResolvedNode::DefinitionRef { def, operand } =
+        definition_ref(lens, tt, kind)?
+    else {
+        unreachable!()
+    };
+    Ok(ResolvedNode::DefinitionRef {
+        def: def.unregistered(),
+        operand,
+    })
+}
+
 fn resolve_date_time_range(
     lens: &Lens,
     first: Operand,
@@ -1685,12 +1835,14 @@ fn resolve_date_time_range(
             let resolved = resolve_query_node(lens, *node)?;
             match resolved {
                 ResolvedNode::Nest {
-                    mut keys,
+                    keys,
                     nvalue,
                     context,
                 } => {
                     let nv = nvalue.unwrap_or_else(|| {
-                        keys.pop().expect("Nest must have at least one key")
+                        keys.last()
+                            .cloned()
+                            .expect("Nest must have at least one key")
                     });
                     Ok(ResolvedNode::NestMatch {
                         keys,
@@ -2523,6 +2675,87 @@ fn validate_order_op_not_partial_glob(node: &ResolvedNode) -> Result<()> {
     Ok(())
 }
 
+fn resolve_proj_node_with_literal(
+    lens: &Lens,
+    proj: ResolvedNode,
+    op: ComparisonOp,
+    lit: Label,
+    lit_is_lhs: bool,
+) -> Result<ResolvedNode> {
+    match proj {
+        ResolvedNode::Nest {
+            keys,
+            nvalue,
+            context,
+        } => {
+            if keys.len() == 1 && nvalue.is_none() {
+                match keys.into_iter().next().unwrap() {
+                    ResolvedOperand::TagRef { tag_type, .. } => {
+                        let node = if lit_is_lhs {
+                            resolve_single_match(
+                                lens,
+                                Operand::Literal(lit),
+                                op,
+                                Operand::TypeRef(tag_type),
+                            )?
+                        } else {
+                            resolve_single_match(
+                                lens,
+                                Operand::TypeRef(tag_type),
+                                op,
+                                Operand::Literal(lit),
+                            )?
+                        };
+                        Ok(if let Some(ctx) = context {
+                            ResolvedNode::And(vec![*ctx, node])
+                        } else {
+                            node
+                        })
+                    }
+                    ResolvedOperand::Calculation(calc) => {
+                        let final_op =
+                            if lit_is_lhs { flip_op(op) } else { op };
+                        Ok(ResolvedNode::CalculationMatch {
+                            calc: *calc,
+                            op: final_op,
+                            rhs: NvalueRhs::Label(lit),
+                        })
+                    }
+                    other => {
+                        let final_op =
+                            if lit_is_lhs { flip_op(op) } else { op };
+                        Ok(ResolvedNode::NestMatch {
+                            keys: vec![other.clone()],
+                            nvalue: other,
+                            op: final_op,
+                            rhs: NvalueRhs::Label(lit),
+                            context,
+                        })
+                    }
+                }
+            } else {
+                let nv = nvalue.unwrap_or_else(|| {
+                    keys.last()
+                        .cloned()
+                        .expect("Nest must have at least one key")
+                });
+                let final_op = if lit_is_lhs { flip_op(op) } else { op };
+                Ok(ResolvedNode::NestMatch {
+                    keys,
+                    nvalue: nv,
+                    op: final_op,
+                    rhs: NvalueRhs::Label(lit),
+                    context,
+                })
+            }
+        }
+        other => bail!(
+            "Query operand in comparison must resolve to Nest, got: {:?}",
+            other
+        ),
+    }
+}
+
 /// メイン解決ロジック（15パターンの比較処理）
 fn resolve_single_match(
     lens: &Lens,
@@ -2790,14 +3023,14 @@ fn resolve_single_match(
             let resolved = resolve_query_node(lens, *node)?;
             match resolved {
                 ResolvedNode::Nest {
-                    mut keys,
+                    keys,
                     nvalue,
                     context,
                 } => {
                     // 比較値は常に Nest の「最後の値」。
                     // nvalue はその最後の値を明示したもの。ない場合は keys の最後が最後の値。
                     let nv = nvalue.unwrap_or_else(|| {
-                        keys.pop().expect("Nest must have at least one key")
+                        keys.last().cloned().expect("Nest must have at least one key")
                     });
                     Ok(ResolvedNode::NestMatch {
                         keys,
@@ -2807,10 +3040,22 @@ fn resolve_single_match(
                         context,
                     })
                 }
-                ResolvedNode::And(ref nodes)
-                    if nodes.iter().any(|n| n.get_projection().is_some()) =>
-                {
-                    Ok(resolved)
+                ResolvedNode::And(mut nodes) => {
+                    if let Some(idx) =
+                        nodes.iter().position(|n| n.get_projection().is_some())
+                    {
+                        let proj = nodes.remove(idx);
+                        let matched_proj = resolve_proj_node_with_literal(
+                            lens, proj, op, lit, false,
+                        )?;
+                        match matched_proj {
+                            ResolvedNode::And(inner) => nodes.extend(inner),
+                            other => nodes.push(other),
+                        }
+                        Ok(ResolvedNode::And(nodes))
+                    } else {
+                        bail!("Query operand in comparison must contain projection")
+                    }
                 }
                 _ => bail!(
                     "Query operand in comparison must resolve to Nest, got: {:?}",
@@ -2822,12 +3067,12 @@ fn resolve_single_match(
             let resolved = resolve_query_node(lens, *node)?;
             match resolved {
                 ResolvedNode::Nest {
-                    mut keys,
+                    keys,
                     nvalue,
                     context,
                 } => {
                     let nv = nvalue.unwrap_or_else(|| {
-                        keys.pop().expect("Nest must have at least one key")
+                        keys.last().cloned().expect("Nest must have at least one key")
                     });
                     Ok(ResolvedNode::NestMatch {
                         keys,
@@ -2837,10 +3082,22 @@ fn resolve_single_match(
                         context,
                     })
                 }
-                ResolvedNode::And(ref nodes)
-                    if nodes.iter().any(|n| n.get_projection().is_some()) =>
-                {
-                    Ok(resolved)
+                ResolvedNode::And(mut nodes) => {
+                    if let Some(idx) =
+                        nodes.iter().position(|n| n.get_projection().is_some())
+                    {
+                        let proj = nodes.remove(idx);
+                        let matched_proj = resolve_proj_node_with_literal(
+                            lens, proj, op, lit, true,
+                        )?;
+                        match matched_proj {
+                            ResolvedNode::And(inner) => nodes.extend(inner),
+                            other => nodes.push(other),
+                        }
+                        Ok(ResolvedNode::And(nodes))
+                    } else {
+                        bail!("Query operand in comparison must contain projection")
+                    }
                 }
                 _ => bail!(
                     "Query operand in comparison must resolve to Nest, got: {:?}",
@@ -2972,6 +3229,116 @@ pub struct ResolvedOrder {
     pub desc: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSource {
+    TagsPartition,
+    OneView,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DefinitionStorage {
+    pub item_references: Option<PathBuf>,
+    pub tags_dir: Option<PathBuf>,
+    pub indexed: bool,
+    pub attach_item_tags: bool,
+}
+
+fn oneview_sources_exist(store: &crate::db::Store) -> bool {
+    use crate::db::TargetTable;
+    [
+        TargetTable::BaseTags,
+        TargetTable::TagsByLocation,
+        TargetTable::SystemTags,
+        TargetTable::UserTags,
+        TargetTable::ItemReferences,
+        TargetTable::RemovedFiles,
+    ]
+    .into_iter()
+    .all(|target| store.path_for_target(target).exists())
+}
+
+fn has_parquet_file(dir: &Path) -> bool {
+    dir.read_dir().is_ok_and(|mut entries| {
+        entries.any(|e| {
+            e.is_ok_and(|p| {
+                p.path().extension().is_some_and(|ext| ext == "parquet")
+            })
+        })
+    })
+}
+
+fn has_any_parquet(dir: &Path) -> bool {
+    dir.read_dir().is_ok_and(|entries| {
+        entries.flatten().any(|e| has_parquet_file(&e.path()))
+    })
+}
+
+impl DefinitionStorage {
+    pub fn from_store(store: &crate::db::Store) -> Self {
+        let item_references =
+            Some(store.path_for_target(crate::db::TargetTable::ItemReferences))
+                .filter(|p| p.exists());
+        let tags_dir = Some(store.tags_dir()).filter(|d| d.exists());
+        Self {
+            item_references,
+            tags_dir,
+            indexed: store.is_indexed(),
+            attach_item_tags: oneview_sources_exist(store),
+        }
+    }
+
+    pub fn valid_origins(&self) -> Vec<Origin> {
+        Origin::iter()
+            .filter(|o| *o != Origin::File || self.indexed)
+            .collect()
+    }
+
+    pub fn type_origin_dirs(&self, tag_type: &str) -> Vec<PathBuf> {
+        let Some(dir) = &self.tags_dir else {
+            return Vec::new();
+        };
+        self.valid_origins()
+            .into_iter()
+            .map(|o| {
+                dir.join(format!("origin={}", o.as_str()))
+                    .join(format!("type={tag_type}"))
+            })
+            .filter(|p| has_parquet_file(p))
+            .collect()
+    }
+
+    pub fn tags_query(
+        &self,
+        tag_type: Option<&str>,
+        origins: Option<&[Origin]>,
+    ) -> Option<SelectStatement> {
+        let dir = self.tags_dir.as_ref()?;
+        let readable: Vec<&str> = self
+            .valid_origins()
+            .into_iter()
+            .filter(|o| origins.is_none_or(|os| os.contains(o)))
+            .filter(|o| {
+                let origin_dir = dir.join(format!("origin={}", o.as_str()));
+                if let Some(t) = tag_type {
+                    has_parquet_file(&origin_dir.join(format!("type={t}")))
+                } else {
+                    has_any_parquet(&origin_dir)
+                }
+            })
+            .map(|o| o.as_str())
+            .collect();
+        if readable.is_empty() {
+            return None;
+        }
+        let mut q = crate::util::hive_parquet_query(dir);
+        q.and_where(Expr::col(Col::Origin).is_in(readable));
+        if let Some(t) = tag_type {
+            q.and_where(Expr::col(Col::Type).eq(t));
+        }
+        Some(q)
+    }
+}
+
 // ========== Resolver 構造体 ==========
 
 /// クエリの論理展開と物理解決を統合する構造体
@@ -2981,6 +3348,8 @@ pub struct Resolver {
     pub resolved_query: ResolvedNode,
     /// 解決済みの並び順（with_order で設定。空 = SQL 側の既定の並び）
     resolved_order: Vec<ResolvedOrder>,
+    short: bool,
+    pub definition_storage: DefinitionStorage,
 }
 
 impl Resolver {
@@ -3008,6 +3377,8 @@ impl Resolver {
             expanded_query: expanded,
             resolved_query: optimized,
             resolved_order: Vec::new(),
+            short: false,
+            definition_storage: DefinitionStorage::default(),
         })
     }
 
@@ -3049,6 +3420,47 @@ impl Resolver {
     /// Lens への参照を返す（Fetcherで使用）
     pub fn lens(&self) -> &Lens {
         &self.lens
+    }
+
+    pub fn with_short(mut self, short: bool) -> Self {
+        self.short = short;
+        self
+    }
+
+    pub fn short(&self) -> bool {
+        self.short
+    }
+
+    pub fn with_store(mut self, store: &crate::db::Store) -> Self {
+        self.definition_storage = DefinitionStorage::from_store(store);
+        self
+    }
+
+    pub fn with_store_tags_dir(mut self, tags_dir: Option<PathBuf>) -> Self {
+        self.definition_storage.tags_dir = tags_dir;
+        self.definition_storage.indexed = true;
+        self.definition_storage.attach_item_tags = true;
+        self
+    }
+
+    pub fn get_single_direct_projection(&self) -> Option<String> {
+        let (tag_type, ctx) = single_nest_projection(&self.resolved_query)?;
+        let func = self.lens.look_up(&tag_type)?.logical_function.as_ref()?;
+        func.query()
+            .allows_direct_projection(ctx)
+            .then(|| tag_type.as_str().to_string())
+    }
+
+    pub fn data_source(&self, tag_type: &str) -> DataSource {
+        if self.short
+            && !self
+                .definition_storage
+                .type_origin_dirs(tag_type)
+                .is_empty()
+        {
+            return DataSource::TagsPartition;
+        }
+        DataSource::OneView
     }
 
     /// 並び順を物理解決して保持する。優先順位は
@@ -3103,6 +3515,17 @@ impl Resolver {
     /// 解決済みの並び順を返す（SQL 生成で使用。空 = 既定の並び）。
     pub fn resolved_order(&self) -> &[ResolvedOrder] {
         &self.resolved_order
+    }
+
+    pub fn returns_items(&self) -> bool {
+        if self.resolved_query.has_definition_branch() {
+            return true;
+        }
+        if self.get_projection().is_some() {
+            return !self.is_label_set_op()
+                && self.get_nvalue_condition().is_some();
+        }
+        !self.resolved_query.is_scalar()
     }
 
     /// 投影対象の型を返す
@@ -3163,6 +3586,106 @@ mod tests {
     use crate::query::lens_schema::StorageMapping;
     use crate::tag::TagRegistry;
     use crate::types::{Label, SType};
+
+    fn resolve(query: &str) -> ResolvedNode {
+        let registry = TagRegistry::with_standard();
+        Resolver::new_nowarn(query, &registry)
+            .unwrap()
+            .resolved_query
+    }
+
+    #[test]
+    fn definition_branches_intersect_by_name_only_when_every_operand_has_definitions(
+    ) {
+        assert_eq!(
+            resolve("type:* & origin:builtin")
+                .definition_branches(true)
+                .len(),
+            1
+        );
+        assert!(resolve("type:score & bitical_type:integer")
+            .definition_branches(true)
+            .is_empty());
+    }
+
+    #[test]
+    fn wildcard_all_resolves_to_items_and_unregistered_definitions() {
+        let ResolvedNode::Or(nodes) = resolve("*:*") else {
+            panic!("*:* should resolve to Or")
+        };
+        assert_eq!(nodes.len(), 3);
+        assert!(nodes[1..].iter().all(|n| {
+            matches!(
+                n,
+                ResolvedNode::DefinitionRef { def, .. } if !def.recorded
+            )
+        }));
+    }
+
+    #[test]
+    fn test_resolver_determine_data_source_dynamically() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tags_dir = dir.path().join("tags");
+        let file_ext = tags_dir.join("origin=file/type=extension");
+        std::fs::create_dir_all(&file_ext).unwrap();
+        std::fs::File::create(file_ext.join("data.parquet")).unwrap();
+
+        let registry = TagRegistry::with_standard();
+        let resolver_short = Resolver::new_nowarn("extension:", &registry)
+            .unwrap()
+            .with_short(true)
+            .with_store_tags_dir(Some(tags_dir.clone()));
+
+        assert_eq!(
+            resolver_short.data_source("extension"),
+            DataSource::TagsPartition,
+        );
+        assert_eq!(resolver_short.data_source("size"), DataSource::OneView,);
+        assert_eq!(resolver_short.data_source("mtime"), DataSource::OneView,);
+
+        let resolver_normal = Resolver::new_nowarn("extension:", &registry)
+            .unwrap()
+            .with_short(false)
+            .with_store_tags_dir(Some(tags_dir));
+
+        assert_eq!(
+            resolver_normal.data_source("extension"),
+            DataSource::OneView,
+        );
+    }
+
+    #[test]
+    fn test_definition_storage_type_origin_dirs_respect_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(dir.path().join("db")).unwrap();
+        let file = store.tags_origin_dir(Origin::File);
+        let user = store.tags_origin_dir(Origin::User);
+        for part in [
+            user.join("type=project"),
+            user.join("type=name"),
+            file.join("type=name"),
+        ] {
+            std::fs::create_dir_all(&part).unwrap();
+            std::fs::File::create(part.join("data.parquet")).unwrap();
+        }
+        let storage = DefinitionStorage::from_store(&store);
+        assert_eq!(storage.type_origin_dirs("name"), [user.join("type=name")]);
+
+        std::fs::File::create(store.complete_path()).unwrap();
+        let storage = DefinitionStorage::from_store(&store);
+        let mut names = storage.type_origin_dirs("name");
+        let mut expected = vec![user.join("type=name"), file.join("type=name")];
+        names.sort();
+        expected.sort();
+        assert_eq!(names, expected);
+        assert_eq!(
+            storage.type_origin_dirs("project"),
+            [user.join("type=project")]
+        );
+        assert!(storage.type_origin_dirs("extension").is_empty());
+    }
 
     #[test]
     fn test_is_pure_scalar() {
@@ -3966,6 +4489,114 @@ mod tests {
         let result = Resolver::new_nowarn("max(name:) > *.rs", &reg);
         assert!(result.is_err(), "expected error");
     }
+
+    #[test]
+    fn test_nest_match_preserves_rightmost_key() {
+        let resolved = resolve("extension: &: size: :> 50KB");
+        let nest_match = match resolved {
+            ResolvedNode::NestMatch { .. } => resolved,
+            ResolvedNode::And(nodes) => nodes
+                .into_iter()
+                .find(|n| matches!(n, ResolvedNode::NestMatch { .. }))
+                .expect("expected NestMatch in And"),
+            other => panic!("expected NestMatch, got: {:?}", other),
+        };
+        match nest_match {
+            ResolvedNode::NestMatch { keys, nvalue, .. } => {
+                assert_eq!(keys.len(), 2);
+                assert!(matches!(
+                    nvalue,
+                    ResolvedOperand::TagRef {
+                        tag_type: TagType::Base(SType::Size),
+                        ..
+                    }
+                ));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_nest_datetime_match_preserves_rightmost_key() {
+        let resolved = resolve(r#"extension: &: mtime: :> "2025-01-01""#);
+        let nest_match = match resolved {
+            ResolvedNode::NestMatch { .. } => resolved,
+            ResolvedNode::And(nodes) => nodes
+                .into_iter()
+                .find(|n| matches!(n, ResolvedNode::NestMatch { .. }))
+                .expect("expected NestMatch in And"),
+            other => panic!("expected NestMatch, got: {:?}", other),
+        };
+        match nest_match {
+            ResolvedNode::NestMatch {
+                keys,
+                nvalue,
+                rhs: NvalueRhs::DateTime(_),
+                ..
+            } => {
+                assert_eq!(keys.len(), 2);
+                assert!(matches!(
+                    nvalue,
+                    ResolvedOperand::TagRef {
+                        tag_type: TagType::Base(SType::Mtime),
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected DateTime NestMatch, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_label_comparison_with_parenthesized_and_projection() {
+        let resolved = resolve("(extension:rs & size:) :> 50KB");
+        match resolved {
+            ResolvedNode::And(nodes) => {
+                let found = nodes.iter().find(|n| {
+                    matches!(
+                        n,
+                        ResolvedNode::Match {
+                            tag_type: TagType::Base(SType::Size),
+                            ..
+                        }
+                    )
+                });
+                assert!(found.is_some());
+            }
+            other => panic!("expected And, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_single_match_parenthesized_and_projection_direct() {
+        let lens = Lens::base_standard();
+        let query_node = QueryNode::And(vec![
+            QueryNode::TypedTag(TypedTag::new("extension", "rs")),
+            QueryNode::Nest(NestNode {
+                left: None,
+                right: Operand::TypeRef(TagType::Base(SType::Size)),
+            }),
+        ]);
+        let resolved = resolve_single_match(
+            &lens,
+            Operand::Query(Box::new(query_node)),
+            ComparisonOp::Label(crate::query::ast::BasicOp::Gt),
+            Operand::Literal(Label::from(51200)),
+        )
+        .unwrap();
+        match resolved {
+            ResolvedNode::And(nodes) => {
+                assert!(nodes.iter().any(|n| matches!(
+                    n,
+                    ResolvedNode::Match {
+                        tag_type: TagType::Base(SType::Size),
+                        ..
+                    }
+                )));
+            }
+            other => panic!("expected And, got: {:?}", other),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4762,5 +5393,61 @@ mod tests_walk_fold {
             None,
             "sum(size:) + sum(mtime:) should yield None"
         );
+    }
+
+    #[test]
+    fn test_get_single_direct_projection_with_extension() {
+        let r =
+            Resolver::new_nowarn("extension:", &TagRegistry::with_standard())
+                .unwrap();
+        assert_eq!(
+            r.get_single_direct_projection(),
+            Some("extension".to_string())
+        );
+
+        let r2 = Resolver::new_nowarn(
+            "extension: & mtime:>2020-01-01",
+            &TagRegistry::with_standard(),
+        )
+        .unwrap();
+        assert_eq!(r2.get_single_direct_projection(), None);
+    }
+
+    #[test]
+    fn test_get_single_direct_projection_with_stem() {
+        let r = Resolver::new_nowarn("stem:", &TagRegistry::with_standard())
+            .unwrap();
+        assert_eq!(r.get_single_direct_projection(), Some("stem".to_string()));
+
+        let r2 = Resolver::new_nowarn(
+            "stem: & mtime:>2020-01-01",
+            &TagRegistry::with_standard(),
+        )
+        .unwrap();
+        assert_eq!(r2.get_single_direct_projection(), None);
+    }
+
+    #[test]
+    fn test_get_single_direct_projection_same_type_prefix_glob_when_short() {
+        let reg = TagRegistry::with_standard();
+        let r = Resolver::new_nowarn("extension:r* & extension:", &reg)
+            .unwrap()
+            .with_short(true);
+        assert_eq!(r.get_single_direct_projection(), None);
+
+        let r_name = Resolver::new_nowarn("name:a* & name:", &reg)
+            .unwrap()
+            .with_short(true);
+        assert_eq!(r_name.get_single_direct_projection(), None);
+
+        let r_off =
+            Resolver::new_nowarn("extension:r* & extension:", &reg).unwrap();
+        assert_eq!(r_off.get_single_direct_projection(), None);
+
+        let r_mtime =
+            Resolver::new_nowarn("extension: & mtime:>2020-01-01", &reg)
+                .unwrap()
+                .with_short(true);
+        assert_eq!(r_mtime.get_single_direct_projection(), None);
     }
 }

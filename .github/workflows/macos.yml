@@ -1,0 +1,46 @@
+name: macos
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      release:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      ref:
+        type: string
+        required: true
+      release:
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  apple_silicon:
+    runs-on: macos-latest
+    env:
+      TARGET: aarch64-apple-darwin
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - run: cargo build --release --locked --target "$TARGET"
+      - run: cargo test --release --locked --target "$TARGET" --test integration_main test_installer
+      - if: inputs.release
+        run: |
+          asset=ttfm-$TARGET.tar.gz
+          tar czf "$asset" -C "target/$TARGET/release" ttfm
+          shasum -a 256 "$asset" > "$asset.sha256"
+          gh release upload "${{ inputs.ref }}" "$asset" "$asset.sha256" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

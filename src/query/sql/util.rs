@@ -19,16 +19,14 @@ use crate::db::{BiticalType, Col, CustomFunc, Pronoun, Pronoun::*};
 use crate::query::ast::{ArithmeticAggOp, ArithmeticOp, QueryNode};
 use crate::query::lens_resolver::ResolvedNode;
 use crate::query::lens_schema::StorageMapping;
+use crate::query::sql::definition::DefinitionBranch;
 use crate::types::Label;
 use sea_query::{
     BinOper, Condition, Expr, Func, Query, SelectStatement, SimpleExpr,
 };
 use std::collections::HashMap;
 
-/// `SelectStatement` をインライン副問合せ式 (`SimpleExpr`) に変換します。
-pub(super) fn subquery(stmt: SelectStatement) -> SimpleExpr {
-    SimpleExpr::SubQuery(None, Box::new(stmt.into_sub_query_statement()))
-}
+pub(super) use crate::util::subquery;
 
 /// SQL を `SELECT item_id FROM (sql) AS sub` でラップします。
 pub(super) fn wrap_to_item_ids(sql: SelectStatement) -> SelectStatement {
@@ -240,8 +238,8 @@ pub struct AggregationContext {
     pub filter_nodes: HashMap<usize, ResolvedNode>,
     /// Phase 1 収集: Count inner ノード (Phase 2 で SQL 化して agg_inner_sqls へ移動)
     pub inner_nodes: HashMap<usize, ResolvedNode>,
-    /// Phase 1 収集: 定義枝ノード群 (Phase 2 で SQL 化して definition_counts へ移動)
-    pub definition_count_nodes: HashMap<usize, Vec<ResolvedNode>>,
+    /// Phase 1 収集: 定義枝 (Phase 2 で SQL 化して definition_counts へ移動)
+    pub(crate) definition_count_nodes: HashMap<usize, Vec<DefinitionBranch>>,
 }
 
 impl AggregationContext {

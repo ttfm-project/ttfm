@@ -28,6 +28,7 @@ use strum::{Display, EnumIter};
 
 pub mod identifier;
 pub mod sql;
+pub mod tags;
 
 pub use self::sql::CustomFunc;
 
@@ -128,6 +129,26 @@ impl Store {
         self.db_dir.join("live_ids.parquet")
     }
 
+    pub fn tags_dir(&self) -> PathBuf {
+        self.db_dir.join("tags")
+    }
+
+    pub fn tags_origin_dir(&self, origin: crate::types::Origin) -> PathBuf {
+        self.tags_dir().join(format!("origin={}", origin.as_str()))
+    }
+
+    pub fn temp_tags_dir(&self) -> PathBuf {
+        self.db_dir.join("tags.tmp")
+    }
+
+    pub fn complete_path(&self) -> PathBuf {
+        self.db_dir.join(".index_complete")
+    }
+
+    pub fn is_indexed(&self) -> bool {
+        self.complete_path().exists()
+    }
+
     /// ファイルインデックスに関連する Parquet ファイルおよびキャッシュを削除する。
     pub fn clear_index(&self) -> Result<()> {
         let targets = [
@@ -161,6 +182,23 @@ impl Store {
             std::fs::remove_dir_all(&cache_dir).with_context(|| {
                 format!("Failed to remove cache directory: {:?}", cache_dir)
             })?;
+        }
+
+        for dir in [
+            self.tags_origin_dir(crate::types::Origin::File),
+            self.temp_tags_dir(),
+            self.db_dir.join("tags.old"),
+        ] {
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).with_context(|| {
+                    format!("Failed to remove tags directory: {:?}", dir)
+                })?;
+            }
+        }
+
+        let complete_path = self.complete_path();
+        if complete_path.exists() {
+            let _ = std::fs::remove_file(&complete_path);
         }
         Ok(())
     }
@@ -316,6 +354,8 @@ pub enum Tbl {
     IdItem,
     Target,
     Master,
+    ItemTags,
+    Tags,
 }
 
 /// SQL クエリのデータソース（OneView テーブルまたは Parquet ファイル）。
@@ -391,6 +431,7 @@ pub enum Pronoun {
     Stored,
     Volatile,
     OrdSrc,
+    Labels,
 }
 
 /// Volatile Column
@@ -436,7 +477,7 @@ impl BiticalType {
             | Col::ScanHash
             | Col::BasenameScanHash => BiticalType::Integer,
             Col::LabelDouble => BiticalType::Double,
-            Col::LabelBool => BiticalType::Boolean,
+            Col::LabelBool | Col::IsAttached => BiticalType::Boolean,
             _ => BiticalType::String,
         }
     }
@@ -688,6 +729,12 @@ pub enum DuckDbFunc {
     TypeOf,
     StringAgg,
     StartsWith,
+    EndsWith,
+    Substr,
+    #[iden = "split_part"]
+    SplitPart,
+    #[iden = "length"]
+    Length,
 }
 
 #[derive(Iden, Clone, Copy)]
@@ -1211,8 +1258,20 @@ mod tests {
             db_dir.join("live_ids.parquet"),
         ];
         // 削除対象のダミーディレクトリを作成
+        let store = Store::open(&db_dir).unwrap();
         let cache_dir = db_dir.join("cache");
         let cache_file = cache_dir.join("dummy_cache.parquet");
+        let file_part = store
+            .tags_origin_dir(crate::types::Origin::File)
+            .join("type=extension");
+        let user_part = store
+            .tags_origin_dir(crate::types::Origin::User)
+            .join("type=project");
+        let builtin_part = store
+            .tags_origin_dir(crate::types::Origin::Builtin)
+            .join("type=status");
+        let temp_tags_dir = store.temp_tags_dir();
+        let old_tags_dir = db_dir.join("tags.old");
 
         // 残す対象のダミーファイルを作成
         let files_to_keep = [
@@ -1224,15 +1283,20 @@ mod tests {
         // 物理ファイル・ディレクトリ作成
         fs::create_dir_all(&cache_dir).unwrap();
         fs::write(&cache_file, b"cache").unwrap();
+        for part in [&file_part, &user_part, &builtin_part] {
+            fs::create_dir_all(part).unwrap();
+            fs::write(part.join("data.parquet"), b"tags").unwrap();
+        }
+        fs::create_dir_all(&temp_tags_dir).unwrap();
+        fs::write(temp_tags_dir.join("dummy.parquet"), b"tmp").unwrap();
+        fs::create_dir_all(&old_tags_dir).unwrap();
+        fs::write(old_tags_dir.join("dummy.parquet"), b"old").unwrap();
         for file in &files_to_delete {
             fs::write(file, b"test").unwrap();
         }
         for file in &files_to_keep {
             fs::write(file, b"keep").unwrap();
         }
-
-        // Storeをオープン
-        let store = Store::open(&db_dir).unwrap();
 
         // clear_index を呼び出し
         store.clear_index().unwrap();
@@ -1242,6 +1306,26 @@ mod tests {
             assert!(!file.exists(), "File should be deleted: {:?}", file);
         }
         assert!(!cache_dir.exists(), "Cache directory should be deleted");
+        assert!(
+            !store.tags_origin_dir(crate::types::Origin::File).exists(),
+            "File origin tags should be deleted"
+        );
+        assert!(
+            user_part.join("data.parquet").exists(),
+            "User origin tags should be kept"
+        );
+        assert!(
+            builtin_part.join("data.parquet").exists(),
+            "Builtin origin tags should be kept"
+        );
+        assert!(
+            !temp_tags_dir.exists(),
+            "Temp tags directory should be deleted"
+        );
+        assert!(
+            !old_tags_dir.exists(),
+            "Old tags directory should be deleted"
+        );
 
         // 残っていることを検証
         for file in &files_to_keep {
@@ -1255,5 +1339,38 @@ mod tests {
         let store = Store::open(temp_dir.path()).unwrap();
         let path = store.path_for_target(TargetTable::TagsByLocation);
         assert!(path.ends_with("tags_by_location.parquet"));
+    }
+
+    #[test]
+    fn test_store_tags_paths_and_tbl() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(temp_dir.path()).unwrap();
+        assert_eq!(store.tags_dir(), temp_dir.path().join("tags"));
+        assert_eq!(
+            store.tags_origin_dir(crate::types::Origin::File),
+            temp_dir.path().join("tags/origin=file")
+        );
+        assert_eq!(
+            store.tags_origin_dir(crate::types::Origin::User),
+            temp_dir.path().join("tags/origin=user")
+        );
+        assert_eq!(store.temp_tags_dir(), temp_dir.path().join("tags.tmp"));
+        assert_eq!(
+            store.complete_path(),
+            temp_dir.path().join(".index_complete")
+        );
+        assert_eq!(sea_query::Iden::to_string(&Tbl::ItemTags), "item_tags");
+        assert_eq!(sea_query::Iden::to_string(&Tbl::Tags), "tags");
+    }
+
+    #[test]
+    fn test_store_is_indexed_checks_complete_file_without_caching() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        assert!(!store.is_indexed());
+        std::fs::File::create(store.complete_path()).unwrap();
+        assert!(store.is_indexed());
+        std::fs::remove_file(store.complete_path()).unwrap();
+        assert!(!store.is_indexed());
     }
 }

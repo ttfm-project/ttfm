@@ -45,6 +45,8 @@ pub trait OperandFormat: Sized {
     fn is_point(&self) -> bool;
 
     fn as_bitical(&self) -> Bitical;
+
+    fn representative_type(&self) -> SType;
 }
 
 /// バイトサイズ表記（`1MB` / `*MB` / `2.*MB` / `*.5MB`）を解釈した結果。
@@ -241,6 +243,10 @@ impl OperandFormat for ByteSizeRange {
             | ByteSizeRange::Periodic { lo, .. } => Bitical::Integer(*lo),
         }
     }
+
+    fn representative_type(&self) -> SType {
+        SType::Size
+    }
 }
 
 impl OperandFormat for crate::types::DateTimeRange {
@@ -265,6 +271,10 @@ impl OperandFormat for crate::types::DateTimeRange {
                 crate::types::DateTimeRange::slots_min_timestamp(slots),
             ),
         }
+    }
+
+    fn representative_type(&self) -> SType {
+        SType::Mtime
     }
 }
 
@@ -308,6 +318,10 @@ impl OperandFormat for ItemIdRange {
     fn as_bitical(&self) -> Bitical {
         Bitical::Integer(self.lo)
     }
+
+    fn representative_type(&self) -> SType {
+        SType::ItemId
+    }
 }
 
 impl OperandFormat for crate::types::Bitical {
@@ -336,6 +350,14 @@ impl OperandFormat for crate::types::Bitical {
 
     fn as_bitical(&self) -> Bitical {
         self.clone()
+    }
+
+    fn representative_type(&self) -> SType {
+        match self {
+            Bitical::Integer(_) | Bitical::Double(_) => SType::Size,
+            Bitical::Boolean(_) => SType::IsDir,
+            Bitical::String(_) | Bitical::Uuid(_) => SType::Name,
+        }
     }
 }
 
@@ -620,5 +642,20 @@ mod tests {
             value.to_formatted(),
             Formatted::Bitical(Bitical::Integer(42))
         );
+    }
+
+    #[test]
+    fn test_formatted_representative_type() {
+        let rep = |s: &str| {
+            Bitical::String(s.to_string())
+                .to_formatted()
+                .representative_type()
+        };
+        assert_eq!(rep("50KB"), SType::Size);
+        assert_eq!(rep("2024-01-01"), SType::Mtime);
+        assert_eq!(rep("File(1)"), SType::ItemId);
+        assert_eq!(rep("100"), SType::Size);
+        assert_eq!(rep("false"), SType::IsDir);
+        assert_eq!(rep("big.rs"), SType::Name);
     }
 }

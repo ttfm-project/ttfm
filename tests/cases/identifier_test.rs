@@ -99,3 +99,12 @@ fn next_user_ignores_builtin_rows_in_item_references() {
         store_with(&[(TargetTable::ItemReferences, &[7, -B + 5])]);
     assert_eq!(next(&store, Origin::User, 1).unwrap(), vec![8]);
 }
+
+#[test]
+fn next_file_reads_only_file_block_rows_in_user_tags() {
+    let (store, _dir) = store_with(&[
+        (TargetTable::FileReferences, &[8 * B + 2]),
+        (TargetTable::UserTags, &[7, 8 * B + 5]),
+    ]);
+    assert_eq!(next(&store, Origin::File, 1).unwrap(), vec![8 * B + 6]);
+}

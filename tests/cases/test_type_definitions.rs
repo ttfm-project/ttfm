@@ -24,8 +24,10 @@ use ttfm::{
         QueryType, WriteOptions,
     },
     indexing::Indexer,
+    rank::SystemRank,
+    response::Item,
     tag::{TagFunction, TagRegistry},
-    types::{ItemId, ItemKind, SType, TagType, TypedTag},
+    types::{BiticalType, ItemId, ItemKind, Origin, SType, TagType, TypedTag},
     SearchOptions,
 };
 
@@ -42,7 +44,7 @@ fn setup() -> (Store, TagRegistry, TempDir) {
     let store = Store::open(&db_dir).unwrap();
     Indexer::new(&store, &registry).initialize_tables().unwrap();
     Indexer::new(&store, &registry)
-        .run_single(&root, None::<&fn(usize)>, false)
+        .run_single(&root, None, false)
         .unwrap();
     (store, registry, dir)
 }
@@ -73,7 +75,7 @@ fn type_includes_builtin_and_user_defined_types() -> anyhow::Result<()> {
         SearchOptions::default(),
     )?;
 
-    // (a) 組み込み登録型（hash）が固定 Sys id の Stored・registry の default_rank で載る
+    // (a) 組み込み登録型（hash）が固定 Sys id の Stored で載る。未登録なので rank は default_rank - 20。
     let hash_item = results
         .results
         .iter()
@@ -89,8 +91,8 @@ fn type_includes_builtin_and_user_defined_types() -> anyhow::Result<()> {
     );
     assert_eq!(
         hash_item.rank,
-        ttfm::rank::get_rank_by_name(&registry, "hash"),
-        "hash rank should fall back to the registry's default_rank"
+        ttfm::rank::get_rank_by_name(&registry, "hash") - 20,
+        "unregistered hash rank is the registry default_rank minus 20"
     );
 
     // (b) ユーザー定義タグの型（project）が Volatile で載る
@@ -532,11 +534,7 @@ fn count_definition_ref_mixed_or_with_projection() -> anyhow::Result<()> {
     let registry = TagRegistry::with_standard();
     let store = Store::open(&db_dir)?;
     Indexer::new(&store, &registry).initialize_tables()?;
-    Indexer::new(&store, &registry).run_single(
-        &root,
-        None::<&fn(usize)>,
-        false,
-    )?;
+    Indexer::new(&store, &registry).run_single(&root, None, false)?;
 
     let type_count = ttfm::search::search_nowarn(
         &store,
@@ -1293,7 +1291,7 @@ fn setup_with_files(names: &[&str]) -> (Store, TagRegistry, TempDir) {
     let store = Store::open(&db_dir).unwrap();
     Indexer::new(&store, &registry).initialize_tables().unwrap();
     Indexer::new(&store, &registry)
-        .run_single(&root, None::<&fn(usize)>, false)
+        .run_single(&root, None, false)
         .unwrap();
     (store, registry, dir)
 }
@@ -1959,7 +1957,7 @@ fn zero_affected_cast_skips_conversion() -> anyhow::Result<()> {
         WriteOptions::default(),
         &mut warnings,
     )?;
-    assert_eq!(resp.updated, 6); // Volatile -> Stored の型定義アイテム 6 タグのみ更新
+    assert_eq!(resp.updated, 5);
     assert_eq!(resp.deleted, 0);
 
     reg.load_type_configs(&store)?;
@@ -1986,5 +1984,821 @@ fn test_uuid_tag_assignment_and_validation() -> anyhow::Result<()> {
     );
     assert!(res.is_err(), "Setting bitical_type:uuid must be rejected");
 
+    Ok(())
+}
+
+#[test]
+fn test_definition_search_unindexed_and_indexed() -> anyhow::Result<()> {
+    // 1. Without complete marker (unindexed):
+    // is_indexed() returns false, resolving in-memory built-in types
+    // without accessing storage.
+    let dir = tempfile::tempdir()?;
+    let db_dir = dir.path().join("db");
+    let store = Store::open(&db_dir)?;
+    let registry = TagRegistry::with_standard();
+    assert!(!store.is_indexed());
+
+    let list_empty = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "type:*",
+        SearchOptions::default(),
+    )?;
+    assert!(list_empty
+        .results
+        .iter()
+        .any(|i| i.raw_repr() == "filename"));
+    let count_empty = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "count(type:*)",
+        SearchOptions::default(),
+    )?;
+    assert_eq!(
+        count_empty.results[0].raw_repr(),
+        list_empty.results.len().to_string()
+    );
+
+    let res_tag = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "tag:\"project:*\"",
+        SearchOptions::default(),
+    )?;
+    assert!(res_tag.results.is_empty());
+
+    let res_system = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "origin:system",
+        SearchOptions::default(),
+    )?;
+    assert!(!res_system.results.is_empty());
+    assert!(res_system.results.iter().all(|i| {
+        let org = i.origin();
+        matches!(org, Origin::Builtin | Origin::File | Origin::Plugin)
+    }));
+
+    // 2. With complete marker created upon index completion:
+    // is_indexed() returns true, reading from tags/ and item_references.
+    let (store, registry, _dir) = setup_with_files(&["main.rs"]);
+    assert!(store.is_indexed());
+    edit(
+        &store,
+        &registry,
+        "filename:main.rs",
+        Some("project:x"),
+        QueryType::Tag,
+        None,
+        WriteOptions::default(),
+        &mut Vec::new(),
+    )?;
+    assert!(store.tags_dir().exists());
+
+    let list_populated = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "type:*",
+        SearchOptions::default(),
+    )?;
+    assert_eq!(
+        list_populated
+            .results
+            .iter()
+            .filter(|i| i.raw_repr() == "filename")
+            .count(),
+        1
+    );
+    let count_populated = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "count(type:*)",
+        SearchOptions::default(),
+    )?;
+    assert_eq!(
+        count_populated.results[0].raw_repr(),
+        list_populated.results.len().to_string()
+    );
+
+    let res = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "tag:\"project:*\"",
+        SearchOptions::default(),
+    )?;
+    assert!(res.results.iter().any(|i| i.raw_repr() == "project:x"));
+
+    let nest = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "extension: &: count()",
+        SearchOptions::default(),
+    )?;
+    assert_eq!(
+        nest.results
+            .iter()
+            .map(|i| i.raw_repr())
+            .collect::<Vec<_>>(),
+        vec!["rs"]
+    );
+
+    let diff = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "type:* - type:\"ext*\"",
+        SearchOptions::default(),
+    )?;
+    assert!(!diff.results.iter().any(|i| i.raw_repr().starts_with("ext")));
+    assert!(diff.results.iter().any(|i| i.raw_repr() == "filename"));
+
+    Ok(())
+}
+
+fn origin_labels(store: &Store, origin: Origin, tag_type: &str) -> Vec<String> {
+    let dir = store
+        .tags_origin_dir(origin)
+        .join(format!("type={tag_type}"));
+    let sql = format!(
+        "SELECT label FROM read_parquet('{}/*.parquet') ORDER BY label",
+        dir.display().to_string().replace('\'', "''")
+    );
+    let mut stmt = store.conn.prepare(&sql).unwrap();
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn setup_empty_store() -> (Store, TagRegistry, tempfile::TempDir) {
+    crate::cases::raise_fd_limit();
+    let dir = tempfile::tempdir().unwrap();
+    let registry = TagRegistry::with_standard();
+    let store = Store::open(dir.path().join("db")).unwrap();
+    Indexer::new(&store, &registry).initialize_tables().unwrap();
+    (store, registry, dir)
+}
+
+fn setup_name_overlap() -> (Store, TagRegistry, tempfile::TempDir) {
+    let (store, registry, dir) = setup_with_files(&["foo.txt", "bar.txt"]);
+    edit(
+        &store,
+        &registry,
+        "filename:bar.txt",
+        Some("name:foo.txt"),
+        QueryType::Tag,
+        None,
+        WriteOptions::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    edit(
+        &store,
+        &registry,
+        "filename:foo.txt",
+        Some("project:x"),
+        QueryType::Tag,
+        None,
+        WriteOptions::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    (store, registry, dir)
+}
+
+fn tag_names(
+    store: &Store,
+    registry: &TagRegistry,
+    query: &str,
+) -> anyhow::Result<Vec<String>> {
+    let res = ttfm::search::search_nowarn(
+        store,
+        registry,
+        query,
+        SearchOptions::default(),
+    )?;
+    Ok(res.results.iter().map(|i| i.raw_repr()).collect())
+}
+
+#[test]
+fn test_tags_dictionary_partitioned_by_origin() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_name_overlap();
+    assert_eq!(origin_labels(&store, Origin::User, "name"), ["foo.txt"]);
+    assert_eq!(
+        origin_labels(&store, Origin::File, "name"),
+        ["files", "foo.txt"]
+    );
+    assert_eq!(origin_labels(&store, Origin::User, "project"), ["x"]);
+    assert!(!store
+        .tags_origin_dir(Origin::File)
+        .join("type=project")
+        .exists());
+    assert!(store
+        .tags_origin_dir(Origin::File)
+        .join("type=extension")
+        .exists());
+    assert!(!store
+        .tags_origin_dir(Origin::User)
+        .join("type=extension")
+        .exists());
+    let mut names = tag_names(&store, &registry, "tag:\"name:*\"")?;
+    names.sort();
+    assert_eq!(names, ["name:files", "name:foo.txt"]);
+    assert!(tag_names(&store, &registry, "tag:\"project:*\"")?
+        .contains(&"project:x".to_string()));
+    Ok(())
+}
+
+#[test]
+fn test_clear_keeps_non_file_tags_dictionary() -> anyhow::Result<()> {
+    let (store, registry, dir) = setup_name_overlap();
+    store.clear_index()?;
+    assert!(!store.is_indexed());
+    assert!(!store.tags_origin_dir(Origin::File).exists());
+    assert_eq!(origin_labels(&store, Origin::User, "name"), ["foo.txt"]);
+    assert_eq!(
+        tag_names(&store, &registry, "tag:\"name:*\"")?,
+        ["name:foo.txt"]
+    );
+
+    Indexer::new(&store, &registry).run_single(
+        &dir.path().canonicalize()?.join("files"),
+        None,
+        false,
+    )?;
+    assert!(store.is_indexed());
+    assert_eq!(
+        origin_labels(&store, Origin::File, "name"),
+        ["bar.txt", "files", "foo.txt"]
+    );
+    assert_eq!(origin_labels(&store, Origin::User, "name"), ["foo.txt"]);
+    Ok(())
+}
+
+#[test]
+fn test_unindexed_edit_creates_user_tags_dictionary() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_empty_store();
+    let id = ttfm::tagging::add_item(&store, &registry, "note", "memo")?;
+    edit(
+        &store,
+        &registry,
+        &format!("item_id:{id}"),
+        Some("project:x"),
+        QueryType::Tag,
+        None,
+        WriteOptions::default(),
+        &mut Vec::new(),
+    )?;
+    assert!(!store.is_indexed());
+    assert!(!store.tags_origin_dir(Origin::File).exists());
+    assert_eq!(origin_labels(&store, Origin::User, "project"), ["x"]);
+    assert!(tag_names(&store, &registry, "tag:\"project:*\"")?
+        .contains(&"project:x".to_string()));
+    Ok(())
+}
+
+#[test]
+fn test_difference_mixed_definition_and_item_subtracts_items_and_keeps_definitions(
+) -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["foo.rs", "bar.txt"]);
+    edit(
+        &store,
+        &registry,
+        "filename:foo.rs",
+        Some("project:x"),
+        QueryType::Tag,
+        None,
+        WriteOptions::default(),
+        &mut Vec::new(),
+    )?;
+    edit(
+        &store,
+        &registry,
+        "filename:bar.txt",
+        Some("project:y"),
+        QueryType::Tag,
+        None,
+        WriteOptions::default(),
+        &mut Vec::new(),
+    )?;
+    let res = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "(tag:\"project:*\" | extension:rs) - project:x",
+        SearchOptions::default(),
+    )?;
+    let names: Vec<String> = res.results.iter().map(|i| i.raw_repr()).collect();
+    assert_eq!(
+        sorted(names),
+        vec!["project:x".to_string(), "project:y".to_string()]
+    );
+    Ok(())
+}
+
+#[test]
+fn test_difference_pure_definitions_returns_subtracted_definitions(
+) -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_empty_store();
+    ttfm::tagging::add_item(&store, &registry, "tag", "project:a")?;
+    ttfm::tagging::add_item(&store, &registry, "tag", "project:b")?;
+    ttfm::tagging::add_item(&store, &registry, "tag", "project:c")?;
+    let res = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "tag:\"project:*\" - tag:\"project:b\"",
+        SearchOptions::default(),
+    )?;
+    let names: Vec<String> = res.results.iter().map(|i| i.raw_repr()).collect();
+    assert_eq!(names, ["project:a", "project:c"]);
+    Ok(())
+}
+
+#[test]
+fn test_difference_count_matches_definition_fetch_count() -> anyhow::Result<()>
+{
+    let (store, registry, _dir) = setup_empty_store();
+    ttfm::tagging::add_item(&store, &registry, "tag", "project:a")?;
+    ttfm::tagging::add_item(&store, &registry, "tag", "project:b")?;
+    ttfm::tagging::add_item(&store, &registry, "tag", "project:c")?;
+    let list_res = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "tag:\"project:*\" - tag:\"project:b\"",
+        SearchOptions::default(),
+    )?;
+    let count_res = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "count(tag:\"project:*\" - tag:\"project:b\")",
+        SearchOptions::default(),
+    )?;
+    assert_eq!(count_res.results.len(), 1);
+    assert_eq!(
+        count_res.results[0].raw_repr(),
+        list_res.results.len().to_string()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_tags_dictionary_schema_contains_is_attached_column(
+) -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["foo.txt"]);
+    ttfm::tagging::add_item(&store, &registry, "tag", "project:unused")?;
+    let sql = format!(
+        "SELECT label, is_attached FROM read_parquet('{}/origin=user/type=project/*.parquet')",
+        store.tags_dir().display()
+    );
+    let mut stmt = store.conn.prepare(&sql)?;
+    let rows: Vec<(String, bool)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .map(Result::unwrap)
+        .collect();
+    assert!(rows.iter().any(|(l, att)| l == "unused" && !*att));
+    Ok(())
+}
+
+#[test]
+fn test_short_projection_excludes_unused_registered_definitions(
+) -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["foo.txt"]);
+    edit(
+        &store,
+        &registry,
+        "filename:foo.txt",
+        Some("project:used"),
+        QueryType::Tag,
+        None,
+        WriteOptions::default(),
+        &mut Vec::new(),
+    )?;
+    ttfm::tagging::add_item(&store, &registry, "tag", "project:unused")?;
+    let short_res = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "project:",
+        SearchOptions {
+            short: true,
+            ..Default::default()
+        },
+    )?;
+    let labels: Vec<String> =
+        short_res.results.iter().map(|i| i.raw_repr()).collect();
+    assert!(labels.contains(&"used".to_string()));
+    assert!(!labels.contains(&"unused".to_string()));
+    Ok(())
+}
+
+fn search_all(
+    store: &Store,
+    registry: &TagRegistry,
+    query: &str,
+) -> anyhow::Result<Vec<Item>> {
+    Ok(ttfm::search::search_nowarn(
+        store,
+        registry,
+        query,
+        SearchOptions::default(),
+    )?
+    .results)
+}
+
+fn find<'a>(items: &'a [Item], repr: &str) -> Option<&'a Item> {
+    items.iter().find(|i| i.raw_repr() == repr)
+}
+
+fn position(items: &[Item], repr: &str) -> usize {
+    items
+        .iter()
+        .position(|i| i.raw_repr() == repr)
+        .unwrap_or_else(|| panic!("{repr} should be in the results"))
+}
+
+fn scalar(
+    store: &Store,
+    registry: &TagRegistry,
+    query: &str,
+) -> anyhow::Result<usize> {
+    let items = search_all(store, registry, query)?;
+    assert_eq!(items.len(), 1, "{query} should return one scalar");
+    Ok(items[0].raw_repr().parse()?)
+}
+
+fn nest_counts(
+    store: &Store,
+    registry: &TagRegistry,
+    query: &str,
+) -> anyhow::Result<Vec<(String, Option<String>)>> {
+    let mut counts: Vec<(String, Option<String>)> =
+        search_all(store, registry, query)?
+            .iter()
+            .map(|i| (i.raw_repr(), i.representative.display_nvalue()))
+            .collect();
+    counts.sort();
+    Ok(counts)
+}
+
+fn sorted(mut names: Vec<String>) -> Vec<String> {
+    names.sort();
+    names
+}
+
+struct Hits(Vec<Item>);
+
+impl Hits {
+    fn find(&self, repr: &str) -> Option<&Item> {
+        self.0.iter().find(|i| i.raw_repr() == repr)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+fn search(store: &Store, registry: &TagRegistry, query: &str) -> Hits {
+    Hits(search_all(store, registry, query).unwrap())
+}
+
+fn tag(
+    store: &Store,
+    registry: &TagRegistry,
+    search_query: &str,
+    edit_query: &str,
+) -> anyhow::Result<()> {
+    edit(
+        store,
+        registry,
+        search_query,
+        Some(edit_query),
+        QueryType::Tag,
+        None,
+        WriteOptions::default(),
+        &mut Vec::new(),
+    )?;
+    Ok(())
+}
+
+fn untag(
+    store: &Store,
+    registry: &TagRegistry,
+    search_query: &str,
+    edit_query: &str,
+) -> anyhow::Result<()> {
+    edit(
+        store,
+        registry,
+        search_query,
+        Some(edit_query),
+        QueryType::Untag,
+        None,
+        WriteOptions::default(),
+        &mut Vec::new(),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn string_user_type_accepts_unquoted_number_and_untags_by_raw_value(
+) -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    tag(&store, &registry, "type:weight", "bitical_type:string")?;
+    tag(&store, &registry, "filename:a.txt", "weight:130")?;
+    assert!(search(&store, &registry, "weight:\"130\"")
+        .find("a.txt")
+        .is_some());
+    untag(&store, &registry, "filename:a.txt", "weight:130")?;
+    assert!(search(&store, &registry, "weight:*").is_empty());
+    Ok(())
+}
+
+#[test]
+fn double_user_type_untags_by_integer_literal_matching_saved_double(
+) -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["b.txt"]);
+    tag(&store, &registry, "type:height", "bitical_type:double")?;
+    tag(&store, &registry, "filename:b.txt", "height:120")?;
+    assert!(search(&store, &registry, "height:").find("120").is_some());
+    untag(&store, &registry, "filename:b.txt", "height:120")?;
+    assert!(search(&store, &registry, "height:*").is_empty());
+    Ok(())
+}
+
+#[test]
+fn cast_to_string_user_type_untags_by_unquoted_formatted_representation(
+) -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    tag(&store, &registry, "type:weight", "bitical_type:integer")?;
+    tag(&store, &registry, "filename:a.txt", "weight:120")?;
+    tag(&store, &registry, "type:weight", "bitical_type:double")?;
+    tag(&store, &registry, "type:weight", "bitical_type:string")?;
+    untag(&store, &registry, "filename:a.txt", "weight:120.0")?;
+    assert!(search(&store, &registry, "weight:*").is_empty());
+    Ok(())
+}
+
+#[test]
+fn integer_user_type_rejects_invalid_string_on_tag_and_untag(
+) -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    tag(&store, &registry, "type:weight", "bitical_type:integer")?;
+    let err_tag =
+        tag(&store, &registry, "filename:a.txt", "weight:hoge").unwrap_err();
+    assert!(err_tag
+        .to_string()
+        .contains("type 'weight' is integer, cannot assign \"hoge\""));
+    let err_untag =
+        untag(&store, &registry, "filename:a.txt", "weight:hoge").unwrap_err();
+    assert!(err_untag
+        .to_string()
+        .contains("type 'weight' is integer, cannot assign \"hoge\""));
+    Ok(())
+}
+
+#[test]
+fn system_rank_untags_quoted_integer_matching_saved_rank() -> anyhow::Result<()>
+{
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    tag(&store, &registry, "filename:a.txt", "rank:3")?;
+    untag(&store, &registry, "filename:a.txt", "rank:\"3\"")?;
+    assert!(search(&store, &registry, "rank:3").is_empty());
+    Ok(())
+}
+
+#[test]
+fn stem_and_extension_reject_path_separators_on_tag() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    assert!(tag(&store, &registry, "filename:a.txt", "stem:sub/inner").is_err());
+    assert!(tag(&store, &registry, "filename:a.txt", "stem:..").is_err());
+    assert!(
+        tag(&store, &registry, "filename:a.txt", "extension:tar/gz").is_err()
+    );
+    assert!(tag(&store, &registry, "filename:a.txt", "filename:..").is_err());
+    assert!(
+        tag(&store, &registry, "filename:a.txt", "filename:../out.txt")
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn implicit_string_user_type_registered_by_quoted_value() -> anyhow::Result<()>
+{
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    tag(&store, &registry, "filename:a.txt", "proj:\"12\"")?;
+    let desc = registry.type_config(&TagType::from("proj"));
+    assert_eq!(desc.and_then(|c| c.bitical_type), Some(BiticalType::String));
+    Ok(())
+}
+
+#[test]
+fn implicit_integer_user_type_projection_returns_matching_rows(
+) -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    tag(&store, &registry, "filename:a.txt", "proj:12")?;
+    let res = search(&store, &registry, "proj:");
+    assert!(res.find("12").is_some_and(|i| i.id.is_file()));
+    Ok(())
+}
+
+#[test]
+fn batch_mixed_type_inference_rejected_with_error() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["1.txt", "x.txt"]);
+    let err = tag(&store, &registry, "filename:*.txt", "proj:{1}").unwrap_err();
+    assert!(err.to_string().contains("cannot assign"));
+    Ok(())
+}
+
+#[test]
+fn wildcard_query_includes_unregistered_definitions() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    let items = search_all(&store, &registry, "*:*")?;
+    assert!(
+        find(&items, "a.txt").is_some_and(|i| i.item_kind == ItemKind::File)
+    );
+    assert!(find(&items, "size")
+        .is_some_and(|i| Origin::within(i.id.as_i64()) == Origin::Builtin));
+    assert!(find(&items, "filename:a.txt").is_some_and(|i| !i.id.is_stored()));
+    Ok(())
+}
+
+#[test]
+fn wildcard_query_lists_registered_definition_once() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    edit(
+        &store,
+        &registry,
+        "tag:\"project:a\"",
+        None,
+        QueryType::Tag,
+        None,
+        WriteOptions::default(),
+        &mut Vec::new(),
+    )?;
+    let items = search_all(&store, &registry, "*:*")?;
+    assert_eq!(
+        items.iter().filter(|i| i.raw_repr() == "project:a").count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn unregistered_definitions_rank_below_files() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    let items = search_all(&store, &registry, "*:*")?;
+    assert!(position(&items, "a.txt") < position(&items, "name"));
+    assert_eq!(find(&items, "name").unwrap().rank, SystemRank::NAME - 20);
+    Ok(())
+}
+
+#[test]
+fn count_all_matches_wildcard_result_count() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    assert_eq!(
+        scalar(&store, &registry, "count()")?,
+        search_all(&store, &registry, "*:*")?.len()
+    );
+    Ok(())
+}
+
+#[test]
+fn removed_file_false_includes_definitions() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    let items = search_all(&store, &registry, "removed_file:false")?;
+    assert!(find(&items, "size").is_some());
+    Ok(())
+}
+
+#[test]
+fn nest_count_of_all_items_excludes_definitions() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt", "b.txt"]);
+    assert_eq!(
+        nest_counts(&store, &registry, "parentdir: &: count()")?,
+        nest_counts(&store, &registry, "parentdir: &: count(item_kind:file)")?,
+    );
+    Ok(())
+}
+
+#[test]
+fn builtin_type_and_origin_builtin_returns_builtin_types() -> anyhow::Result<()>
+{
+    let (store, registry, _dir) = setup_empty_store();
+    let builtin = sorted(tag_names(&store, &registry, "origin:builtin")?);
+    assert!(!builtin.is_empty());
+    assert_eq!(
+        sorted(tag_names(&store, &registry, "type:* & origin:builtin")?),
+        builtin
+    );
+    assert_eq!(
+        sorted(tag_names(&store, &registry, "origin:builtin & type:*")?),
+        builtin
+    );
+    Ok(())
+}
+
+#[test]
+fn definition_ref_and_typed_tag_intersect() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    tag(&store, &registry, "type:score", "bitical_type:integer")?;
+    tag(&store, &registry, "filename:a.txt", "project:ttfm")?;
+    tag(&store, &registry, "tag:\"project:ttfm\"", "milestone:m1")?;
+    assert_eq!(
+        tag_names(&store, &registry, "type:score & bitical_type:integer")?,
+        ["score"]
+    );
+    assert_eq!(
+        tag_names(&store, &registry, "type:score & bitical_type:")?,
+        ["integer"]
+    );
+    assert_eq!(
+        tag_names(&store, &registry, "tag:\"project:ttfm\" & milestone:m1")?,
+        ["project:ttfm"]
+    );
+    Ok(())
+}
+
+#[test]
+fn or_of_definition_ref_and_items_lists_registered_once() -> anyhow::Result<()>
+{
+    let (store, registry, _dir) = setup_empty_store();
+    tag(&store, &registry, "type:score", "bitical_type:integer")?;
+    assert_eq!(
+        tag_names(&store, &registry, "type:score | bitical_type:integer")?,
+        ["score"]
+    );
+    assert_eq!(
+        scalar(
+            &store,
+            &registry,
+            "count(type:score | bitical_type:integer)"
+        )?,
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn name_and_item_kind_do_not_match_unregistered_definitions(
+) -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_empty_store();
+    assert!(tag_names(&store, &registry, "name:size")?.is_empty());
+    assert!(tag_names(&store, &registry, "item_kind:type")?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn tag_wildcard_registers_all_definitions() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup_with_files(&["a.txt"]);
+    tag(&store, &registry, "*:*", "milestone:m1")?;
+    assert!(
+        tag_names(&store, &registry, "item_kind:type & milestone:m1")?
+            .contains(&"size".to_string())
+    );
+    assert!(
+        tag_names(&store, &registry, "item_kind:tag & milestone:m1")?
+            .contains(&"filename:a.txt".to_string())
+    );
+    assert_eq!(
+        tag_names(&store, &registry, "filename:a.txt & milestone:m1")?,
+        ["a.txt"]
+    );
+    Ok(())
+}
+
+#[test]
+fn wildcard_type_groups_follow_result_order() -> anyhow::Result<()> {
+    let (store, registry, _dir) = setup();
+
+    let response = ttfm::search::search_nowarn(
+        &store,
+        &registry,
+        "*:*",
+        SearchOptions::default(),
+    )?;
+    let position = |item: &Item| {
+        response
+            .results
+            .iter()
+            .position(|r| std::ptr::eq(r, item))
+            .unwrap()
+    };
+
+    for _ in 0..32 {
+        let firsts: Vec<usize> = response
+            .iter_type_groups()
+            .iter()
+            .map(|g| position(g.results[0]))
+            .collect();
+        assert!(firsts.len() >= 2);
+        assert!(firsts.windows(2).all(|w| w[0] < w[1]));
+
+        let groups = response.iter_type_groups();
+        let group_of = |name: &str| {
+            groups
+                .iter()
+                .position(|g| g.results.iter().any(|r| r.raw_repr() == name))
+                .unwrap()
+        };
+        assert!(group_of("name") < group_of("filename:foo.txt"));
+    }
     Ok(())
 }

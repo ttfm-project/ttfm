@@ -53,6 +53,14 @@ impl Representative {
             None => keys,
         }
     }
+
+    pub fn display_short(&self, registry: &TagRegistry) -> String {
+        let keys = self.display_keys(registry);
+        match self.display_nvalue() {
+            Some(nv) => format!("{}\t{}", keys, nv),
+            None => keys,
+        }
+    }
 }
 
 impl From<Vec<TypedTag>> for Representative {
@@ -194,10 +202,11 @@ impl<T> PagedResult<T> {
 impl SearchResponse {
     /// 通常表示用に、アイテムの Kind とタグ構成（属性構成）が同一なものを集約して返します。
     pub fn iter_type_groups(&self) -> Vec<TypeGroup<'_>> {
-        use std::collections::{BTreeSet, HashMap};
+        use indexmap::IndexMap;
+        use std::collections::BTreeSet;
 
-        let mut groups: HashMap<(ItemKind, BTreeSet<TagType>), Vec<&Item>> =
-            HashMap::new();
+        let mut groups: IndexMap<(ItemKind, BTreeSet<TagType>), Vec<&Item>> =
+            IndexMap::new();
 
         for res in &self.results {
             let mut keys = BTreeSet::new();
@@ -227,23 +236,13 @@ impl SearchResponse {
             groups.entry(group_key).or_default().push(res);
         }
 
-        let mut sorted_groups: Vec<TypeGroup> = groups
+        groups
             .into_iter()
             .map(|((_, keys), results)| TypeGroup {
                 keys: keys.into_iter().collect(),
                 results,
             })
-            .collect();
-
-        // 集約ルール: カラム数の多い順、その次は属性名の昇順でソートして安定表示を確保
-        sorted_groups.sort_by(|a, b| {
-            b.keys
-                .len()
-                .cmp(&a.keys.len())
-                .then_with(|| a.keys.cmp(&b.keys))
-        });
-
-        sorted_groups
+            .collect()
     }
 }
 
@@ -388,7 +387,6 @@ impl Item {
     pub fn apply_tag(&mut self, tag: TypedTag, origin: Origin) {
         // 検索結果に必要な基本属性を補完
         match tag.tag_type() {
-            TagType::Base(SType::Rank) => self.rank = tag.label.as_i64(),
             TagType::Base(SType::Size) => {
                 self.intrinsic.size =
                     Some(crate::types::FileSize(tag.label.as_i64()))
@@ -724,6 +722,29 @@ mod tests {
     }
 
     #[test]
+    fn test_iter_type_groups_follows_result_order() {
+        let file = create_test_result();
+        let mut bare = create_test_result();
+        bare.id = 2.into();
+        bare.intrinsic.size = None;
+        bare.tags = Tags::new();
+
+        let response = SearchResponse {
+            results: vec![bare, file],
+            cid: None,
+            total_count: None,
+            has_more: false,
+            progress: Progress::default(),
+            query: String::new(),
+        };
+
+        let groups = response.iter_type_groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].results[0].id, 2.into());
+        assert_eq!(groups[1].results[0].id, 1.into());
+    }
+
+    #[test]
     fn test_search_result_new_empty_scalar() {
         let id = ItemId::new_volatile();
         let res = Item::new_empty(id, ItemKind::Volatile);
@@ -903,5 +924,27 @@ mod tests {
             ItemKind::File,
         );
         assert_eq!(item_plugin.large_origin(), LargeOrigin::System);
+    }
+
+    #[test]
+    fn test_representative_display_short_format() {
+        use crate::types::{Label, SType, TypedTag};
+        let registry = TagRegistry::default();
+        let repr = Representative {
+            tags: vec![TypedTag::new(SType::Name, "docs")],
+            nvalue: Some(Label::from("1258291")),
+        };
+        assert_eq!(repr.display_short(&registry), "docs\t1258291");
+    }
+
+    #[test]
+    fn test_representative_display_short_without_nvalue() {
+        use crate::types::{SType, TypedTag};
+        let registry = TagRegistry::default();
+        let repr = Representative {
+            tags: vec![TypedTag::new(SType::Name, "docs")],
+            nvalue: None,
+        };
+        assert_eq!(repr.display_short(&registry), "docs");
     }
 }

@@ -28,7 +28,7 @@ use crate::db::{
     BiticalType, Col, CustomFunc, Pronoun::*, QueryResultCol, Src,
 };
 use crate::query::ast::ComparisonOp;
-use crate::query::lens_resolver::ResolvedOperand;
+use crate::query::lens_resolver::{DefinitionStorage, ResolvedOperand};
 use crate::query::lens_schema::{to_bin_op, StorageMapping};
 use crate::types::{Label, SType};
 use sea_query::{
@@ -342,12 +342,14 @@ pub(super) fn build_scalar_match_sql(
 pub(super) fn build_resolved_scalar_sql(
     src: &Src,
     op: &ResolvedOperand,
+    storage: &DefinitionStorage,
 ) -> SelectStatement {
-    let agg_ctx = build_aggregation_context_for_operand(src, op);
+    let agg_ctx = build_aggregation_context_for_operand(src, op, storage);
     let inner = match op {
         ResolvedOperand::Aggregation(agg) => {
             if needs_nest_context(agg.inner_node()) {
-                let nest_ctx = build_nest_context(src, agg.inner_node());
+                let nest_ctx =
+                    build_nest_context(src, agg.inner_node(), storage);
                 build_agg_nest(src, agg, &agg_ctx, &nest_ctx)
             } else {
                 build_agg(src, agg, &agg_ctx)
@@ -362,7 +364,7 @@ pub(super) fn build_resolved_scalar_sql(
                 }
             });
             let scalar_expr = if needs_nest {
-                let nest_ctx = build_nest_context_for_operand(src, op);
+                let nest_ctx = build_nest_context_for_operand(src, op, storage);
                 build_agg_operand_subquery_nest(src, op, &agg_ctx, &nest_ctx)
             } else {
                 build_agg_operand_subquery(src, op, &agg_ctx)

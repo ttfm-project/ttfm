@@ -204,7 +204,8 @@ pub fn expand_eval(
     match node {
         QueryNode::Eval(inner) => {
             let expanded_inner = expand_eval(*inner, store, registry, sink)?;
-            let resolver = Resolver::from_node(expanded_inner, registry, sink)?;
+            let resolver = Resolver::from_node(expanded_inner, registry, sink)?
+                .with_store(store);
             let fetcher = Fetcher::new(&resolver, &store.conn);
             let items = fetcher.fetch_for_eval(0, 0)?;
             if items.is_empty() {

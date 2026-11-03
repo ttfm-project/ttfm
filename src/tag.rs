@@ -19,6 +19,8 @@ use crate::db::{BiticalType, TargetTable};
 use crate::query::ast::{
     BasicOp, ComparisonNode, ComparisonOp, Operand, QueryNode,
 };
+use crate::query::format::OperandFormat;
+use crate::query::lens_resolver::ResolvedNode;
 use crate::response::Item;
 use crate::types::{
     Bitical, BiticalAssociate, Biticals, ItemKind, Label, LargeOrigin, Origin,
@@ -105,6 +107,7 @@ pub trait Scan {
 // ============================================================
 
 /// タグ値の表示フォーマット定義。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayFormat {
     pub id: String,
     pub label: String,
@@ -242,6 +245,10 @@ pub trait Query: Send + Sync {
     /// `compose_projection_implication` を呼ぶこと（既定実装以外には自動適用されない）。
     fn implies(&self) -> Option<(TagType, Label)> {
         None
+    }
+
+    fn allows_direct_projection(&self, context: Option<&ResolvedNode>) -> bool {
+        context.is_none()
     }
 
     /// Projection（type:形式）を QueryNode へ展開する。
@@ -492,12 +499,47 @@ pub trait Edit: Send + Sync {
             }
         }
     }
-    fn validate(&self, new: &Label) -> Result<Label> {
-        Ok(new.clone())
+    fn validate(&self, raw: &str, quoted: bool) -> Result<Label> {
+        label_from_raw(raw, quoted)
     }
     fn inject(&self, _item: &Item) -> Option<Label> {
         None
     }
+}
+
+fn label_from_raw(raw: &str, quoted: bool) -> Result<Label> {
+    if quoted {
+        return Label::other(Bitical::String(raw.to_string())).to_ok();
+    }
+    match Bitical::parse(raw) {
+        Some(Ok(b)) => {
+            crate::query::format::attach_formatted_node(Label::other(b)).to_ok()
+        }
+        Some(Err(e)) => bail!("invalid value {raw:?}: {e}"),
+        None => bail!("invalid value {raw:?}"),
+    }
+}
+
+pub(crate) fn type_cannot_assign(
+    tag_type: &TagType,
+    expected: BiticalType,
+    raw: &str,
+) -> anyhow::Error {
+    let article = match expected {
+        BiticalType::Integer => "an",
+        _ => "a",
+    };
+    anyhow::anyhow!(
+        concat!(
+            "type '{}' is {}, cannot assign \"{}\". ",
+            "Please enter {article} {} or change type definition."
+        ),
+        tag_type,
+        expected,
+        raw,
+        expected,
+        article = article,
+    )
 }
 
 // ============================================================
@@ -531,6 +573,14 @@ pub trait TagFunction: Send + Sync {
     fn default_rank(&self) -> Rank {
         crate::rank::SystemRank::DEFAULT
     }
+
+    fn exclude_in_tags_table(&self) -> bool {
+        false
+    }
+
+    fn format_suggestions(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 // ============================================================
@@ -544,6 +594,17 @@ pub struct TypeConfig {
     pub strategy: Option<EditStrategy>,
     pub bitical_type: Option<crate::types::BiticalType>,
     pub is_explicit: bool,
+}
+
+impl TypeConfig {
+    pub const fn new() -> Self {
+        Self {
+            display_unit: None,
+            strategy: None,
+            bitical_type: None,
+            is_explicit: false,
+        }
+    }
 }
 
 /// タグ型の個別設定（TypeConfig）を保持するインメモリレジストリ。
@@ -576,6 +637,43 @@ impl TypeRegistry {
     }
 }
 
+pub struct UserTypeEdit {
+    pub tag_type: TagType,
+    pub config: TypeConfig,
+}
+
+impl Edit for UserTypeEdit {
+    fn strategy(&self) -> EditStrategy {
+        self.config.strategy.unwrap_or(EditStrategy::Append)
+    }
+
+    fn validate(&self, raw: &str, quoted: bool) -> Result<Label> {
+        if let Some(bt) = self.config.bitical_type {
+            match Bitical::parse_as(raw, bt) {
+                Some(b) => Label::other(b).to_ok(),
+                None => Err(type_cannot_assign(&self.tag_type, bt, raw)),
+            }
+        } else {
+            label_from_raw(raw, quoted)
+        }
+    }
+}
+
+pub enum EditRef<'a> {
+    Builtin(&'a dyn Edit),
+    User(UserTypeEdit),
+}
+
+impl<'a> std::ops::Deref for EditRef<'a> {
+    type Target = dyn Edit + 'a;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Builtin(e) => *e,
+            Self::User(e) => e,
+        }
+    }
+}
+
 // ============================================================
 // TagRegistry
 // ============================================================
@@ -589,6 +687,18 @@ pub struct TagRegistry {
     builtin_offsets: std::collections::HashMap<String, u32>,
     next_builtin_offset: u32,
     type_configs: std::sync::RwLock<TypeRegistry>,
+}
+
+impl Clone for TagRegistry {
+    fn clone(&self) -> Self {
+        let type_configs = self.type_configs.read().unwrap().clone();
+        Self {
+            functions: self.functions.clone(),
+            builtin_offsets: self.builtin_offsets.clone(),
+            next_builtin_offset: self.next_builtin_offset,
+            type_configs: std::sync::RwLock::new(type_configs),
+        }
+    }
 }
 
 impl Default for TagRegistry {
@@ -625,6 +735,25 @@ impl TagRegistry {
 
     pub fn type_configs(&self) -> TypeRegistry {
         self.type_configs.read().unwrap().clone()
+    }
+
+    pub fn edit_of(&self, tag_type: &TagType) -> Result<EditRef<'_>> {
+        if let Some(f) = self.get(tag_type.as_str()) {
+            if let Some(e) = f.edit() {
+                Ok(EditRef::Builtin(e))
+            } else {
+                bail!(
+                    "tag type '{tag_type}' is registered but not editable (Forbidden)"
+                );
+            }
+        } else {
+            let cfg =
+                self.type_config(tag_type).unwrap_or_else(TypeConfig::new);
+            Ok(EditRef::User(UserTypeEdit {
+                tag_type: tag_type.clone(),
+                config: cfg,
+            }))
+        }
     }
 
     #[cfg(test)]
@@ -667,6 +796,37 @@ impl TagRegistry {
 
     pub fn iter_arcs(&self) -> impl Iterator<Item = Arc<dyn TagFunction>> + '_ {
         self.functions.values().cloned()
+    }
+
+    pub fn is_excluded_from_tags(&self, name: &str) -> bool {
+        self.get(name)
+            .map(|f| f.exclude_in_tags_table())
+            .unwrap_or(false)
+    }
+
+    pub fn get_excluded_from_tags(&self) -> Vec<String> {
+        self.functions
+            .iter()
+            .filter_map(|(name, func)| {
+                if func.exclude_in_tags_table() {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn location_tag_types(&self) -> Vec<String> {
+        self.functions
+            .iter()
+            .filter(|(_, f)| {
+                f.edit()
+                    .map(|e| e.strategy() == EditStrategy::Relocate)
+                    .unwrap_or(false)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     pub fn iter_all_for_rank(&self) -> impl Iterator<Item = (&str, Rank)> + '_ {
@@ -967,6 +1127,16 @@ impl Edit for FilenameFn {
     fn path_components(&self) -> &'static [SType] {
         &[SType::Stem, SType::Extension]
     }
+    fn validate(&self, raw: &str, _quoted: bool) -> Result<Label> {
+        if raw.is_empty()
+            || raw == "."
+            || raw == ".."
+            || raw.chars().any(std::path::is_separator)
+        {
+            bail!("filename cannot contain path separator or parent reference");
+        }
+        Label::other(Bitical::String(raw.to_string())).to_ok()
+    }
 }
 impl Index for FilenameFn {
     fn role(&self) -> ScanRole {
@@ -988,6 +1158,31 @@ impl Query for FilenameFn {
     }
     fn implies(&self) -> Option<(TagType, Label)> {
         Some((SType::IsDir.into(), Label::from(false)))
+    }
+}
+
+fn is_only_is_dir_false_context(context: Option<&ResolvedNode>) -> bool {
+    match context {
+        None => true,
+        Some(ctx) => match ctx {
+            ResolvedNode::Match {
+                tag_type,
+                op,
+                label,
+                ..
+            } if tag_type.as_str() == "is_dir"
+                && matches!(
+                    op,
+                    ComparisonOp::Label(BasicOp::Eq)
+                        | ComparisonOp::Scalar(BasicOp::Eq)
+                )
+                && (*label == Label::from(false)
+                    || label.as_str().eq_ignore_ascii_case("false")) =>
+            {
+                true
+            }
+            _ => false,
+        },
     }
 }
 
@@ -1014,12 +1209,22 @@ impl Edit for ExtensionFn {
     fn path_components(&self) -> &'static [SType] {
         &[SType::Extension]
     }
+    fn validate(&self, raw: &str, _quoted: bool) -> Result<Label> {
+        if raw.is_empty() || raw.chars().any(std::path::is_separator) {
+            bail!("extension cannot contain path separator");
+        }
+        Label::other(Bitical::String(raw.to_string())).to_ok()
+    }
 }
 impl Index for ExtensionFn {
     fn role(&self) -> ScanRole {
         ScanRole::Location
     }
     fn extract(&self, path: &Path) -> Result<Option<Bitical>> {
+        let m = get_safe_meta(path)?;
+        if m.is_dir() {
+            return Ok(None);
+        }
         Ok(path
             .extension()
             .map(|e| Bitical::String(e.to_string_lossy().to_lowercase())))
@@ -1031,6 +1236,9 @@ impl Query for ExtensionFn {
     }
     fn implies(&self) -> Option<(TagType, Label)> {
         Some((SType::IsDir.into(), Label::from(false)))
+    }
+    fn allows_direct_projection(&self, context: Option<&ResolvedNode>) -> bool {
+        is_only_is_dir_false_context(context)
     }
     fn interpret(
         &self,
@@ -1198,22 +1406,47 @@ impl Edit for StemFn {
     fn path_components(&self) -> &'static [SType] {
         &[SType::Stem]
     }
+    fn validate(&self, raw: &str, _quoted: bool) -> Result<Label> {
+        if raw.is_empty()
+            || raw == "."
+            || raw == ".."
+            || raw.chars().any(std::path::is_separator)
+        {
+            bail!("stem cannot contain path separator or parent reference");
+        }
+        Label::other(Bitical::String(raw.to_string())).to_ok()
+    }
 }
 impl Index for StemFn {
+    fn role(&self) -> ScanRole {
+        ScanRole::Location
+    }
+
     fn extract(&self, path: &Path) -> Result<Option<Bitical>> {
+        let m = get_safe_meta(path)?;
+        if m.is_dir() {
+            return Ok(None);
+        }
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         Ok(Some(Bitical::String(stem)))
     }
+
     fn target_table(&self) -> TargetTable {
-        TargetTable::BaseTags
+        TargetTable::TagsByLocation
     }
 }
 impl Query for StemFn {
     fn logical_type(&self) -> LogicalType {
         LogicalType::String
+    }
+    fn implies(&self) -> Option<(TagType, Label)> {
+        Some((SType::IsDir.into(), Label::from(false)))
+    }
+    fn allows_direct_projection(&self, context: Option<&ResolvedNode>) -> bool {
+        is_only_is_dir_false_context(context)
     }
 }
 
@@ -1228,6 +1461,9 @@ impl TagFunction for IsDirFn {
     }
     fn query(&self) -> &dyn Query {
         self
+    }
+    fn format_suggestions(&self) -> Vec<String> {
+        vec!["true".to_string(), "false".to_string()]
     }
 }
 impl Index for IsDirFn {
@@ -1521,6 +1757,15 @@ impl TagFunction for SizeFn {
     fn default_rank(&self) -> Rank {
         crate::rank::SystemRank::SIZE
     }
+    fn exclude_in_tags_table(&self) -> bool {
+        true
+    }
+    fn format_suggestions(&self) -> Vec<String> {
+        vec!["10.0MB", "10.0GB", "10.0KB", "10.0TB", "10.0PB", "1B"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
 }
 impl Scan for SizeFn {
     fn name() -> &'static str {
@@ -1619,32 +1864,25 @@ impl Display for SizeFn {
     }
 }
 
-fn format_size_si(bytes: i64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
-    if bytes < 1024 {
-        return format!("{}B", bytes);
+fn format_size(bytes: i64, base: f64, units: &[&str]) -> String {
+    if (bytes as f64) < base {
+        return format!("{bytes}B");
     }
     let mut val = bytes as f64;
     let mut idx = 0;
-    while val >= 1024.0 && idx < UNITS.len() - 1 {
-        val /= 1024.0;
+    while val >= base && idx < units.len() - 1 {
+        val /= base;
         idx += 1;
     }
-    format!("{:.2}{}", val, UNITS[idx])
+    format!("{:.2}{}", val, units[idx])
+}
+
+fn format_size_si(bytes: i64) -> String {
+    format_size(bytes, 1000.0, &["B", "KB", "MB", "GB", "TB", "PB"])
 }
 
 fn format_size_binary(bytes: i64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    if bytes < 1024 {
-        return format!("{}B", bytes);
-    }
-    let mut val = bytes as f64;
-    let mut idx = 0;
-    while val >= 1024.0 && idx < UNITS.len() - 1 {
-        val /= 1024.0;
-        idx += 1;
-    }
-    format!("{:.2}{}", val, UNITS[idx])
+    format_size(bytes, 1024.0, &["B", "KiB", "MiB", "GiB", "TiB", "PiB"])
 }
 
 // --- MtimeFn ---
@@ -1667,6 +1905,22 @@ impl TagFunction for MtimeFn {
     }
     fn default_rank(&self) -> Rank {
         crate::rank::SystemRank::MTIME
+    }
+    fn exclude_in_tags_table(&self) -> bool {
+        true
+    }
+    fn format_suggestions(&self) -> Vec<String> {
+        let now = chrono::Local::now();
+        vec![
+            now.format("%Y-%m-%d").to_string(),
+            now.format("%Y-%m-%d %H:%M").to_string(),
+            now.format("%Y-%m-%d %H:%M:%S").to_string(),
+            now.format("%Y-%m").to_string(),
+            now.format("%Y").to_string(),
+            "today".to_string(),
+            "yesterday".to_string(),
+            "7d ago".to_string(),
+        ]
     }
 }
 impl Edit for MtimeFn {
@@ -1946,19 +2200,39 @@ impl TagFunction for ItemKindFn {
     fn default_rank(&self) -> Rank {
         crate::rank::SystemRank::ITEM_KIND
     }
+    fn format_suggestions(&self) -> Vec<String> {
+        use strum::IntoEnumIterator;
+        crate::types::ItemKind::iter()
+            .map(|k| k.to_string())
+            .collect()
+    }
 }
 impl Edit for ItemKindFn {
     fn strategy(&self) -> EditStrategy {
         EditStrategy::ModifyInjection
     }
     fn inject(&self, item: &Item) -> Option<Label> {
-        let kind = match item.representative.tags.as_slice() {
-            [l] if l.tag_type() == TagType::Base(SType::TypedTag) => {
-                ItemKind::Tag
+        let from_type_tag = item.tags.entries.iter().find_map(|e| {
+            if e.typed_tag.tag_type() != TagType::Base(SType::Type) {
+                return None;
             }
-            [l] if l.tag_type() == TagType::Base(SType::Type) => ItemKind::Type,
-            _ => ItemKind::Note,
-        };
+            match e.typed_tag.as_str().as_str() {
+                "tag" => Some(ItemKind::Tag),
+                "type" => Some(ItemKind::Type),
+                _ => None,
+            }
+        });
+        let kind = from_type_tag.unwrap_or(
+            match item.representative.tags.as_slice() {
+                [l] if l.tag_type() == TagType::Base(SType::TypedTag) => {
+                    ItemKind::Tag
+                }
+                [l] if l.tag_type() == TagType::Base(SType::Type) => {
+                    ItemKind::Type
+                }
+                _ => ItemKind::Note,
+            },
+        );
         Some(Label::from(kind))
     }
 }
@@ -2000,6 +2274,12 @@ impl TagFunction for RankFn {
 impl Edit for RankFn {
     fn strategy(&self) -> EditStrategy {
         EditStrategy::Replace
+    }
+    fn validate(&self, raw: &str, _quoted: bool) -> Result<Label> {
+        let n: i64 = raw.parse().map_err(|_| {
+            crate::query::error::tag_value_not_interpretable("rank", raw)
+        })?;
+        Label::other(Bitical::Integer(n)).to_ok()
     }
 }
 impl Query for RankFn {
@@ -2054,6 +2334,12 @@ impl TagFunction for OriginFn {
     }
     fn query(&self) -> &dyn Query {
         self
+    }
+    fn format_suggestions(&self) -> Vec<String> {
+        use strum::IntoEnumIterator;
+        crate::types::Origin::iter()
+            .map(|o| o.to_string())
+            .collect()
     }
 }
 impl Query for OriginFn {
@@ -2413,6 +2699,157 @@ mod tests {
         reg.register(SimpleTag);
         assert!(reg.get("simple").is_some());
         assert!(reg.get("unknown").is_none());
+    }
+
+    #[test]
+    fn test_tag_function_exclude_in_tags_table() {
+        assert!(!PathFn.exclude_in_tags_table());
+        assert!(SizeFn.exclude_in_tags_table());
+        assert!(MtimeFn.exclude_in_tags_table());
+        assert!(!NameFn.exclude_in_tags_table());
+    }
+
+    #[test]
+    fn test_tag_registry_excluded_from_tags() {
+        let reg = TagRegistry::with_standard();
+        assert!(reg.is_excluded_from_tags("size"));
+        assert!(reg.is_excluded_from_tags("mtime"));
+        assert!(!reg.is_excluded_from_tags("path"));
+        assert!(!reg.is_excluded_from_tags("name"));
+
+        let excluded = reg.get_excluded_from_tags();
+        assert!(excluded.contains(&"size".to_string()));
+        assert!(excluded.contains(&"mtime".to_string()));
+        assert!(!excluded.contains(&"path".to_string()));
+    }
+
+    #[test]
+    fn test_tag_registry_location_tag_types() {
+        let reg = TagRegistry::with_standard();
+        let loc_types = reg.location_tag_types();
+        assert!(loc_types.contains(&"path".to_string()));
+        assert!(loc_types.contains(&"filename".to_string()));
+        assert!(loc_types.contains(&"parentdir".to_string()));
+        assert!(loc_types.contains(&"extension".to_string()));
+        assert!(loc_types.contains(&"stem".to_string()));
+        assert!(!loc_types.contains(&"name".to_string()));
+        assert!(!loc_types.contains(&"is_dir".to_string()));
+        assert!(!loc_types.contains(&"size".to_string()));
+        assert!(!loc_types.contains(&"mtime".to_string()));
+    }
+
+    #[test]
+    fn test_extension_fn_extract_skips_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_with_ext = dir.path().join("sub.dir");
+        std::fs::create_dir(&dir_with_ext).unwrap();
+        let file_with_ext = dir.path().join("file.rs");
+        std::fs::write(&file_with_ext, "content").unwrap();
+
+        let ext_fn = ExtensionFn;
+        assert_eq!(ext_fn.extract(&dir_with_ext).unwrap(), None);
+        assert_eq!(
+            ext_fn.extract(&file_with_ext).unwrap(),
+            Some(Bitical::String("rs".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extension_fn_allows_direct_projection() {
+        let is_dir_false = ResolvedNode::Match {
+            tag_type: TagType::from("is_dir"),
+            storage: crate::query::lens_schema::StorageMapping::Basic {
+                column: SType::IsDir,
+                tag_type: "is_dir".to_string(),
+            },
+            bitical_type: BiticalType::Boolean,
+            op: ComparisonOp::Label(BasicOp::Eq),
+            label: Label::from(false),
+        };
+        let is_dir_true = ResolvedNode::Match {
+            tag_type: TagType::from("is_dir"),
+            storage: crate::query::lens_schema::StorageMapping::Basic {
+                column: SType::IsDir,
+                tag_type: "is_dir".to_string(),
+            },
+            bitical_type: BiticalType::Boolean,
+            op: ComparisonOp::Label(BasicOp::Eq),
+            label: Label::from(true),
+        };
+        let other_node = ResolvedNode::Match {
+            tag_type: TagType::from("name"),
+            storage: crate::query::lens_schema::StorageMapping::Basic {
+                column: SType::Name,
+                tag_type: "name".to_string(),
+            },
+            bitical_type: BiticalType::String,
+            op: ComparisonOp::Label(BasicOp::Eq),
+            label: Label::from("test"),
+        };
+
+        assert!(ExtensionFn.query().allows_direct_projection(None));
+        assert!(ExtensionFn
+            .query()
+            .allows_direct_projection(Some(&is_dir_false)));
+        assert!(!ExtensionFn
+            .query()
+            .allows_direct_projection(Some(&is_dir_true)));
+        assert!(!ExtensionFn
+            .query()
+            .allows_direct_projection(Some(&other_node)));
+
+        assert!(FilenameFn.query().allows_direct_projection(None));
+        assert!(!FilenameFn
+            .query()
+            .allows_direct_projection(Some(&is_dir_false)));
+    }
+
+    #[test]
+    fn test_stem_fn_extract_skips_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub_dir = dir.path().join("sub.dir");
+        std::fs::create_dir(&sub_dir).unwrap();
+        let file = dir.path().join("file.tar.gz");
+        std::fs::write(&file, "content").unwrap();
+
+        let stem_fn = StemFn;
+        assert_eq!(stem_fn.extract(&sub_dir).unwrap(), None);
+        assert_eq!(
+            stem_fn.extract(&file).unwrap(),
+            Some(Bitical::String("file.tar".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_stem_fn_allows_direct_projection() {
+        let is_dir_false = ResolvedNode::Match {
+            tag_type: TagType::from("is_dir"),
+            storage: crate::query::lens_schema::StorageMapping::Basic {
+                column: SType::IsDir,
+                tag_type: "is_dir".to_string(),
+            },
+            bitical_type: BiticalType::Boolean,
+            op: ComparisonOp::Label(BasicOp::Eq),
+            label: Label::from(false),
+        };
+        let is_dir_true = ResolvedNode::Match {
+            tag_type: TagType::from("is_dir"),
+            storage: crate::query::lens_schema::StorageMapping::Basic {
+                column: SType::IsDir,
+                tag_type: "is_dir".to_string(),
+            },
+            bitical_type: BiticalType::Boolean,
+            op: ComparisonOp::Label(BasicOp::Eq),
+            label: Label::from(true),
+        };
+
+        assert!(StemFn.query().allows_direct_projection(None));
+        assert!(StemFn.query().allows_direct_projection(Some(&is_dir_false)));
+        assert!(!StemFn.query().allows_direct_projection(Some(&is_dir_true)));
+        assert_eq!(
+            StemFn.query().implies(),
+            Some((SType::IsDir.into(), Label::from(false)))
+        );
     }
 
     #[test]
@@ -4176,5 +4613,38 @@ mod tests {
             reg.type_config(&crate::types::TagType::from("quota")),
             None
         );
+    }
+
+    #[test]
+    fn test_size_display_si_uses_decimal_divisor() {
+        let si = DisplayFormat::new("si", "KB / MB");
+        let binary = DisplayFormat::new("binary", "KiB / MiB");
+        assert_eq!(SizeFn.show(&Bitical::Integer(999), si.clone()), "999B");
+        assert_eq!(SizeFn.show(&Bitical::Integer(1000), si.clone()), "1.00KB");
+        assert_eq!(SizeFn.show(&Bitical::Integer(2000), si), "2.00KB");
+        assert_eq!(SizeFn.show(&Bitical::Integer(2000), binary), "1.95KiB");
+    }
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    #[test]
+    fn test_size_fn_format_suggestions() {
+        let suggestions = SizeFn.format_suggestions();
+        assert_eq!(
+            suggestions,
+            vec!["10.0MB", "10.0GB", "10.0KB", "10.0TB", "10.0PB", "1B"]
+        );
+    }
+
+    #[test]
+    fn test_mtime_fn_format_suggestions() {
+        let suggestions = MtimeFn.format_suggestions();
+        let now_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(suggestions.first(), Some(&now_str));
+        assert!(suggestions.contains(&"today".to_string()));
+        assert!(!suggestions.iter().any(|s| s.ends_with(' ')));
     }
 }

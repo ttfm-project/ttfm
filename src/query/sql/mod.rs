@@ -232,20 +232,6 @@ pub fn build_flat_table_sql(
     q
 }
 
-/// ノードがスカラー boolean として扱われるべきかを判定する。
-/// CalculationMatch はタグ参照を含む場合はアイテムフィルタとして扱う。
-fn is_boolean_only_node(n: &ResolvedNode) -> bool {
-    match n {
-        ResolvedNode::AggregationMatch { .. }
-        | ResolvedNode::AggregationAggregationMatch { .. }
-        | ResolvedNode::AggregationCalculationMatch { .. }
-        | ResolvedNode::AggregationTagMatch { .. }
-        | ResolvedNode::ScalarMatch { .. } => true,
-        ResolvedNode::CalculationMatch { calc, .. } => !calc.contains_tag(),
-        _ => false,
-    }
-}
-
 /// すべてのクエリ種別に対する統一 SQL エントリポイント。
 /// ResolvedNode の構造を直接見てディスパッチする。
 ///   - LabelSetOp またはnvalue比較なしのProjection → build_fetch_nest_sql (Lv.2)
@@ -258,23 +244,61 @@ pub fn build_fetch_sql(
     n: usize,
     offset: usize,
 ) -> anyhow::Result<SelectStatement> {
+    let storage = &resolver.definition_storage;
     // 並び順（resolver が保持する解決済みの Order）。アイテム行を返す経路
     // （items / 定義枝）にのみ適用し、ラベルグループ（Nest/Projection）と
     // スカラー・ブーリアンには適用しない。
     let orders = resolver.resolved_order();
-    // 定義参照（単体または Or だけで到達可能な枝）を含む場合:
-    // 定義枝と src 由来枝を fetch レベルで束ねる（add_definitions）。
-    // representative は projection と同じ decode_nest 経路で型付けする。
-    if let Some((defs, rest)) =
-        resolver.resolved_query.split_definition_branches()
-    {
-        let rest_fetch = rest.as_ref().map(|rest_node| {
-            let pick = PickNode::new(src, rest_node);
-            build_fetch_items_sql_impl(src, &pick, None, None, true, &[])
+    let query = &resolver.resolved_query;
+    if query.is_pure_definition() {
+        if let ResolvedNode::DefinitionRef { def, .. } = query {
+            if resolver.short() && orders.is_empty() {
+                if let Some(sql) = definition::try_build_physical_order_scan(
+                    src, def, storage, orders, n, offset,
+                ) {
+                    return Ok(sql);
+                }
+            }
+        }
+        return Ok(crate::query::lens_builder::add_definitions(
+            src,
+            &query.definition_branches(false),
+            None,
+            n,
+            offset,
+            orders,
+            storage,
+            resolver.short(),
+        ));
+    }
+    let branches = query.definition_branches(true);
+    if !branches.is_empty() {
+        let items_fetch = (storage.item_references.is_some()
+            || storage.tags_dir.is_some())
+        .then(|| {
+            build_fetch_items_sql_impl(
+                src,
+                &PickNode::new(
+                    src,
+                    &query.without_unregistered_definitions(),
+                    storage,
+                ),
+                None,
+                None,
+                true,
+                &[],
+            )
         });
-        return crate::query::lens_builder::add_definitions(
-            src, &defs, rest_fetch, n, offset, orders,
-        );
+        return Ok(crate::query::lens_builder::add_definitions(
+            src,
+            &branches,
+            items_fetch,
+            n,
+            offset,
+            orders,
+            storage,
+            resolver.short(),
+        ));
     }
     if resolver.get_projection().is_some() {
         if resolver.get_label_set_op_node().is_some()
@@ -283,7 +307,7 @@ pub fn build_fetch_sql(
             return nest::build_fetch_nest_sql(src, resolver, n, offset);
         }
         // nvalue比較あり → Lv.1 フラットリスト（items path）
-        let pick = PickNode::new(src, &resolver.resolved_query);
+        let pick = PickNode::new(src, &resolver.resolved_query, storage);
         let limit = if n > 0 { Some(n + 1) } else { None };
         return Ok(build_fetch_items_sql(
             src,
@@ -300,13 +324,14 @@ pub fn build_fetch_sql(
             return Ok(build_resolved_scalar_sql(
                 src,
                 &ResolvedOperand::Aggregation(agg.clone()),
+                storage,
             ));
         }
         // 集約または純スカラーを key に持つ Nest：単一値を返す
         ResolvedNode::Nest { keys, .. } => {
             let op = keys.first().unwrap();
             if op.contains_aggregation() || op.is_pure_scalar() {
-                return Ok(build_resolved_scalar_sql(src, op));
+                return Ok(build_resolved_scalar_sql(src, op, storage));
             }
         }
         // ブーリアン比較：集約同士／集約とリテラル／リテラル同士 の比較結果を volatile row で返す
@@ -317,12 +342,16 @@ pub fn build_fetch_sql(
         | ResolvedNode::ScalarMatch { .. }
         | ResolvedNode::NestMatch { .. }
         | ResolvedNode::MergedNestMatch { .. }) => {
-            return Ok(build_boolean_sql(src, node));
+            return Ok(build_boolean_sql(src, node, storage));
         }
         // CalculationMatch: タグ参照なし（純スカラー・集約のみ）→ boolean
         // タグ参照を含む場合（例: (size: / 1024) :> 100）はアイテムフィルタへ fall-through
         ResolvedNode::CalculationMatch { calc, .. } if !calc.contains_tag() => {
-            return Ok(build_boolean_sql(src, &resolver.resolved_query));
+            return Ok(build_boolean_sql(
+                src,
+                &resolver.resolved_query,
+                storage,
+            ));
         }
         // NestNestMatch のうち Comparison + Literal 右辺は存在確認ブーリアン
         ResolvedNode::NestNestMatch {
@@ -330,19 +359,27 @@ pub fn build_fetch_sql(
             right_nvalue: ResolvedOperand::Literal(_),
             ..
         } => {
-            return Ok(build_boolean_sql(src, &resolver.resolved_query));
+            return Ok(build_boolean_sql(
+                src,
+                &resolver.resolved_query,
+                storage,
+            ));
         }
         // スカラー比較の And/Or/Difference：全ての直接子がスカラー比較バリアントである場合に限り boolean
         // ラベル比較と演算子が異なるためバリアントで構造的に区別できる
         ResolvedNode::And(nodes) | ResolvedNode::Or(nodes)
             if !nodes.is_empty()
-                && nodes.iter().all(|n| is_boolean_only_node(n)) =>
+                && nodes.iter().all(|n| n.is_boolean_only()) =>
         {
-            return Ok(build_boolean_sql(src, &resolver.resolved_query));
+            return Ok(build_boolean_sql(
+                src,
+                &resolver.resolved_query,
+                storage,
+            ));
         }
         _ => {}
     }
-    let pick = PickNode::new(src, &resolver.resolved_query);
+    let pick = PickNode::new(src, &resolver.resolved_query, storage);
     Ok(build_fetch_items_sql(
         src,
         &pick,
@@ -356,8 +393,9 @@ pub fn build_fetch_sql(
 mod tests {
     use super::*;
     use crate::query::ast::{BasicOp, ComparisonOp, QueryNode};
-    use crate::query::lens_resolver::ResolvedAggregationNode;
-    use crate::query::lens_resolver::ResolvedOperand;
+    use crate::query::lens_resolver::{
+        DefinitionStorage, ResolvedAggregationNode, ResolvedOperand,
+    };
     use crate::types::{Label, SType, TagType, TypedTag};
     use sea_query::{BinOper, PostgresQueryBuilder, SqliteQueryBuilder};
 
@@ -410,7 +448,7 @@ mod tests {
         let query_node = QueryNode::And(vec![]);
         let sql = build_flat_table_sql(
             &Src::OneView,
-            &PickNode::new(&Src::OneView, &node),
+            &PickNode::new(&Src::OneView, &node, &DefinitionStorage::default()),
             &query_node,
             Some(10),
             None,
@@ -460,7 +498,8 @@ mod tests {
             op: ComparisonOp::Scalar(BasicOp::Eq),
             label: Label::from("test"),
         };
-        let pick = PickNode::new(&Src::OneView, &node);
+        let storage = DefinitionStorage::default();
+        let pick = PickNode::new(&Src::OneView, &node, &storage);
         let sql =
             build_fetch_items_sql(&Src::OneView, &pick, Some(10), Some(0), &[]);
         let sql_str = sql.to_string(PostgresQueryBuilder);
@@ -522,7 +561,9 @@ mod tests {
                 },
             ])));
 
-        let agg_ctx = build_aggregation_context_for_agg(&Src::OneView, &agg);
+        let storage = DefinitionStorage::default();
+        let agg_ctx =
+            build_aggregation_context_for_agg(&Src::OneView, &agg, &storage);
         let sql = build_agg(&Src::OneView, &agg, &agg_ctx);
         let sql_str = sql.to_string(PostgresQueryBuilder);
 
@@ -602,7 +643,9 @@ mod tests {
             ])),
         };
 
-        let agg_ctx = build_aggregation_context_for_agg(&Src::OneView, &agg);
+        let storage = DefinitionStorage::default();
+        let agg_ctx =
+            build_aggregation_context_for_agg(&Src::OneView, &agg, &storage);
         let sql = build_agg(&Src::OneView, &agg, &agg_ctx);
         let sql_str = sql.to_string(PostgresQueryBuilder);
 

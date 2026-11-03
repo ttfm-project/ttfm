@@ -62,6 +62,14 @@ pub struct TagRow {
     pub value: Bitical,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexProgress {
+    Scanning { count: usize },
+    Diffing,
+    Extracting { current: usize, total: usize },
+    Merging,
+}
+
 // ========================================================
 // Main Indexer (The Orchestrator)
 // ========================================================
@@ -91,15 +99,14 @@ impl<'a> Indexer<'a> {
     }
 
     /// インデックス作成の全体ワークフローを実行します。
-    pub fn run<P, F>(
+    pub fn run<P>(
         &self,
         roots: &[P],
-        on_progress: Option<&F>,
+        on_progress: Option<&(dyn Fn(IndexProgress) + Sync + Send)>,
         dry_run: bool,
     ) -> Result<usize>
     where
         P: AsRef<Path>,
-        F: Fn(usize) + Sync + Send,
     {
         let roots = normalize_roots(roots)?;
         if roots.is_empty() {
@@ -128,6 +135,9 @@ impl<'a> Indexer<'a> {
         crate::search::clear_cache(&self.store.db_dir);
 
         // 2. Diff Phase
+        if let Some(on_p) = on_progress {
+            on_p(IndexProgress::Diffing);
+        }
         let diff = diff::run_diff(&self.store.conn, &self.store, &roots)?;
 
         // 3. Triage Phase
@@ -136,9 +146,45 @@ impl<'a> Indexer<'a> {
             self.registry,
             diff.to_process,
             diff.dir_changed,
+            on_progress,
         )?;
+
         // 4. Merge Phase
-        merge::run_merge(
+        if let Some(on_p) = on_progress {
+            on_p(IndexProgress::Merging);
+        }
+        // 変更された型を事前に収集
+        let has_changes = !results.is_empty()
+            || !dir_changed_results.is_empty()
+            || !diff.deleted_ids.is_empty();
+        let mut modified_types: rustc_hash::FxHashSet<String> =
+            rustc_hash::FxHashSet::default();
+        if !dir_changed_results.is_empty() {
+            for s in ["path", "filename", "parentdir", "extension"] {
+                modified_types.insert(s.to_string());
+            }
+        }
+        for r in results.iter().chain(dir_changed_results.iter()) {
+            for t in &r.tags {
+                if !matches!(t.tag_type.as_str(), "size" | "mtime") {
+                    modified_types.insert(t.tag_type.clone());
+                }
+            }
+            for t in &r.location_tags {
+                modified_types.insert(t.tag_type.clone());
+            }
+        }
+        if !diff.deleted_ids.is_empty() {
+            let del_types = crate::edit::write::collect_types_for_items(
+                &self.store.conn,
+                &self.store,
+                self.registry,
+                &diff.deleted_ids,
+            )?;
+            modified_types.extend(del_types);
+        }
+
+        let location_changed_ids = merge::run_merge(
             &self.store.conn,
             self.registry,
             &self.store,
@@ -148,22 +194,49 @@ impl<'a> Indexer<'a> {
             &self.store.temp_scan_path(),
             &self.store.temp_live_path(),
             &roots,
-            // |data| self.update_system_items(data),
             |_data| Ok(()),
         )?;
+
+        if !self.store.is_indexed() {
+            crate::db::tags::generate_tags_hive_partitioned(
+                &self.store,
+                &self.store.conn,
+                self.registry,
+            )?;
+        } else if has_changes {
+            if !location_changed_ids.is_empty() {
+                for s in self.registry.location_tag_types() {
+                    modified_types.insert(s);
+                }
+            }
+            if !modified_types.is_empty() {
+                let types_vec: Vec<&str> =
+                    modified_types.iter().map(|s| s.as_str()).collect();
+                crate::db::tags::update_tags_partitions(
+                    &self.store,
+                    &self.store.conn,
+                    self.registry,
+                    &types_vec,
+                )?;
+            }
+        }
+
+        let complete_path = self.store.complete_path();
+        if !complete_path.exists() {
+            std::fs::File::create(&complete_path)?;
+        }
 
         Ok(count)
     }
 
-    pub fn run_single<P, F>(
+    pub fn run_single<P>(
         &self,
         root: P,
-        on_progress: Option<&F>,
+        on_progress: Option<&(dyn Fn(IndexProgress) + Sync + Send)>,
         dry_run: bool,
     ) -> Result<usize>
     where
         P: AsRef<Path>,
-        F: Fn(usize) + Sync + Send,
     {
         self.run(&[root], on_progress, dry_run)
     }
@@ -753,6 +826,27 @@ mod tests {
         let store = Store::open(&db_dir).unwrap();
         Indexer::new(&store, &registry).initialize_tables().unwrap();
         assert!(db_dir.join("file_references.parquet").exists());
+    }
+
+    #[test]
+    fn test_indexer_run_progress_routing() {
+        let dir = tempdir().unwrap();
+        let db_dir = dir.path().join(".ttfm/db");
+        let registry = TagRegistry::with_standard();
+        let store = Store::open(&db_dir).unwrap();
+        let indexer = Indexer::new(&store, &registry);
+        indexer.initialize_tables().unwrap();
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev_clone = std::sync::Arc::clone(&events);
+        let cb = move |p: IndexProgress| ev_clone.lock().unwrap().push(p);
+
+        let count = indexer.run(&[dir.path()], Some(&cb), false).unwrap();
+        assert_eq!(count, 2);
+        let captured = events.lock().unwrap().clone();
+        assert!(captured
+            .iter()
+            .any(|e| matches!(e, IndexProgress::Scanning { .. })));
     }
 
     // #[test]

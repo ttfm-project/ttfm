@@ -81,7 +81,7 @@ fn test_item_id_and_kind_refactoring() {
     std::fs::write(dir.path().join("file1.txt"), "content").unwrap();
     std::fs::write(dir.path().join("file2.txt"), "content").unwrap();
     ttfm::indexing::Indexer::new(&store, &registry)
-        .run_single(dir.path(), None::<&fn(usize)>, false)
+        .run_single(dir.path(), None, false)
         .unwrap();
 
     let res = search::search_nowarn(
@@ -193,4 +193,34 @@ fn item_id_quoted_local_form_resolves_same_as_raw_id() {
         r_raw.results[0].id, r_local.results[0].id,
         "both queries must resolve to same item",
     );
+}
+
+#[test]
+fn item_id_unquoted_local_form_resolves_same_as_raw_id() {
+    let (store, registry) = setup_store();
+    let raw_id =
+        tagging::add_item(&store, &registry, "type", "my_type").unwrap();
+    let o = ttfm::Origin::within(raw_id);
+    let disp = format!("{}({})", o.short(), raw_id - o.block_lo());
+
+    for q in [
+        format!("item_id:{disp}"),
+        format!("item_id: := {disp}"),
+        format!("item_id:>={disp}"),
+        format!("{disp} :<= item_id:"),
+        format!("item_id:{}(*)", o.short()),
+    ] {
+        let ids: Vec<i64> = search::search_nowarn(
+            &store,
+            &registry,
+            &q,
+            SearchOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("{q}: {e}"))
+        .results
+        .iter()
+        .map(|r| r.id.as_i64())
+        .collect();
+        assert!(ids.contains(&raw_id), "{q}: {ids:?}");
+    }
 }
